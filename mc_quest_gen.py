@@ -9,12 +9,19 @@ using an AI provider chain to figure out the per-mod progression.
 Outputs a ready-to-use `config/ftbquests/quests.json` — copy it into your
 Minecraft instance and run `/ftbquests editing_mode` to view/edit.
 
+A standalone `preview.html` file is also produced — open it in any browser
+to see all chapters & quests rendered in an FTB-Quests-like UI (icons,
+dependency lines, click-to-inspect).
+
 Usage:
   python mc_quest_gen.py --setup                          # configure API keys
   python mc_quest_gen.py --test                           # test all providers
   python mc_quest_gen.py -m "Thermal Expansion" "IC2"     # generate quests
-  python mc_quest_gen.py -m "Draconic Evolution" --lang ru
-  python mc_quest_gen.py --mods-file mods.txt -o ./output
+  python mc_quest_gen.py --analyze --mods-file mods.txt   # scoring + interactive
+  python mc_quest_gen.py --append -m "Botania"            # add to existing config
+  python mc_quest_gen.py --regenerate-mod "IC2"           # redo one chapter
+  python mc_quest_gen.py --list-mods -o ./output          # list existing chapters
+  python mc_quest_gen.py --html ./output/config/ftbquests/quests.json  # rerender HTML
 
 Repo: https://github.com/sirksswenenen/mc-quest-gen
 """
@@ -22,12 +29,15 @@ Repo: https://github.com/sirksswenenen/mc-quest-gen
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import textwrap
 import time
 from pathlib import Path
 
+import analyzer
 import ftbquests
+import html_visualizer
 import providers
 import scraper
 
@@ -155,11 +165,63 @@ def process_mod(
     if quests and quests[0].get("tasks"):
         icon = quests[0]["tasks"][0].get("item", icon)
 
-    return ftbquests.make_chapter(
+    chapter = ftbquests.make_chapter(
         title=mod_info["name"],
         quests=quests,
         icon_item=icon,
     )
+    chapter["_modid"] = modid
+    chapter["_mod_source_name"] = mod_name
+    return chapter
+
+
+# ─────────────────────────────────────────────
+# Quest file IO + diff
+# ─────────────────────────────────────────────
+
+def quests_json_path(output_dir: Path) -> Path:
+    return output_dir / "config" / "ftbquests" / "quests.json"
+
+
+def preview_html_path(output_dir: Path) -> Path:
+    return output_dir / "preview.html"
+
+
+def load_existing(output_dir: Path) -> dict | None:
+    p = quests_json_path(output_dir)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def existing_mods(root: dict) -> list[str]:
+    """Return the list of (display-name) mods already in this config."""
+    names: list[str] = []
+    for ch in root.get("chapters", []):
+        name = ch.get("_mod_source_name") or ch.get("title") or ""
+        if name:
+            names.append(name)
+    return names
+
+
+def find_chapter_for_mod(root: dict, mod_name: str) -> int:
+    target = mod_name.strip().lower()
+    for i, ch in enumerate(root.get("chapters", [])):
+        src = (ch.get("_mod_source_name") or "").lower()
+        title = (ch.get("title") or "").lower()
+        if src == target or title == target:
+            return i
+    return -1
+
+
+def write_outputs(root: dict, output_dir: Path) -> tuple[Path, Path]:
+    out_file = ftbquests.write_ftbquests_output(root, output_dir)
+    html_out = preview_html_path(output_dir)
+    html_visualizer.render_html(root, html_out, title="MC Quest Preview")
+    return out_file, html_out
 
 
 # ─────────────────────────────────────────────
@@ -176,10 +238,31 @@ def parse_args() -> argparse.Namespace:
           python mc_quest_gen.py --test
           python mc_quest_gen.py -m "Thermal Expansion" "IC2" "Applied Energistics 2"
           python mc_quest_gen.py --mods-file my_mods.txt -o ./output --lang ru
+          python mc_quest_gen.py --analyze --mods-file my_mods.txt
+          python mc_quest_gen.py --append -m "Botania" -o ./output
+          python mc_quest_gen.py --regenerate-mod "IC2" -o ./output
+          python mc_quest_gen.py --html ./output/config/ftbquests/quests.json
+          python mc_quest_gen.py --list-mods -o ./output
         """),
     )
     p.add_argument("--setup", action="store_true", help="Interactive API key setup wizard")
     p.add_argument("--test", action="store_true", help="Test all configured AI providers")
+    p.add_argument("--analyze", action="store_true",
+                   help="Score mods and let you pick interactively (combine with -m or --mods-file)")
+    p.add_argument("--scan-dir", metavar="DIR",
+                   help="Scan a folder of .jar files and analyze them")
+    p.add_argument("--top", type=int, default=None, metavar="N",
+                   help="With --analyze: pick top-N automatically instead of asking")
+    p.add_argument("--list-mods", action="store_true",
+                   help="List mods already present in the output's quests.json")
+    p.add_argument("--append", action="store_true",
+                   help="Add new mods to existing quests.json without touching old chapters")
+    p.add_argument("--regenerate-mod", metavar="MOD",
+                   help="Regenerate the chapter for ONE specific mod, replacing the old one")
+    p.add_argument("--html", metavar="QUESTS_JSON",
+                   help="Render a preview.html for an existing quests.json (no AI calls)")
+    p.add_argument("--html-out", metavar="FILE",
+                   help="With --html: explicit output path (default: preview.html next to input)")
     p.add_argument("-m", "--mods", nargs="+", metavar="MOD", help="Mod names")
     p.add_argument("--mods-file", metavar="FILE", help="Text file, one mod per line, # comments")
     p.add_argument("-o", "--output", default="./mc_quests_output", metavar="DIR",
@@ -207,6 +290,80 @@ def _print_test_results(results: dict) -> None:
         print(f"  {icon} {name:<{width}}  {status}")
 
 
+def collect_mods(args: argparse.Namespace) -> list[str]:
+    mods: list[str] = []
+    if args.mods:
+        mods.extend(args.mods)
+    if args.mods_file:
+        path = Path(args.mods_file)
+        if not path.exists():
+            print(f"Error: mods file not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                mods.append(line)
+    if args.scan_dir:
+        d = Path(args.scan_dir)
+        discovered = analyzer.discover_mods_from_directory(d)
+        if not discovered:
+            print(f"Warning: no .jar files found in {d}", file=sys.stderr)
+        mods.extend(discovered)
+    # Dedupe preserving order
+    seen = set()
+    out = []
+    for m in mods:
+        key = m.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(m)
+    return out
+
+
+def cmd_html_only(args: argparse.Namespace) -> int:
+    src = Path(args.html)
+    if not src.exists():
+        print(f"Error: file not found: {src}", file=sys.stderr)
+        return 1
+    out = Path(args.html_out) if args.html_out else src.parent / "preview.html"
+    result = html_visualizer.render_from_file(src, out)
+    print(f"Wrote: {result}")
+    return 0
+
+
+def cmd_list_mods(args: argparse.Namespace) -> int:
+    root = load_existing(Path(args.output))
+    if not root:
+        print(f"No quests.json found at {quests_json_path(Path(args.output))}")
+        return 1
+    names = existing_mods(root)
+    if not names:
+        print("No chapters found.")
+        return 0
+    print(f"\nMods in {quests_json_path(Path(args.output))}:")
+    for n in names:
+        ch_idx = find_chapter_for_mod(root, n)
+        ch = root["chapters"][ch_idx]
+        print(f"  - {n}  ({len(ch.get('quests', []))} quests)")
+    return 0
+
+
+def cmd_analyze(args: argparse.Namespace, mods: list[str]) -> list[str]:
+    if not mods:
+        print("Error: --analyze needs a mod list (use -m, --mods-file, or --scan-dir).",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"\nAnalyzing {len(mods)} mod(s)…")
+    results = analyzer.analyze_mods(mods)
+    analyzer.print_analysis_table(results)
+    if args.top is not None:
+        sorted_res = sorted(results, key=lambda r: (-r.score, r.name.lower()))
+        chosen = [r.name for r in sorted_res[: args.top]]
+        print(f"Auto-picked top {len(chosen)}: {', '.join(chosen)}")
+        return chosen
+    return analyzer.interactive_select(results)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -227,18 +384,47 @@ def main() -> None:
             print("\nNo provider works. Run --setup to fix keys.")
             sys.exit(2)
 
-    mods: list[str] = []
-    if args.mods:
-        mods.extend(args.mods)
-    if args.mods_file:
-        path = Path(args.mods_file)
-        if not path.exists():
-            print(f"Error: mods file not found: {path}", file=sys.stderr)
+    if args.html:
+        sys.exit(cmd_html_only(args))
+
+    if args.list_mods:
+        sys.exit(cmd_list_mods(args))
+
+    output_dir = Path(args.output)
+    existing_root = load_existing(output_dir)
+
+    # Regenerate a single mod
+    if args.regenerate_mod:
+        if not existing_root:
+            print(f"Error: no existing quests.json at {quests_json_path(output_dir)}",
+                  file=sys.stderr)
             sys.exit(1)
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                mods.append(line)
+        ai_cfg = providers.load_config()
+        mod_name = args.regenerate_mod
+        idx = find_chapter_for_mod(existing_root, mod_name)
+        chapter = process_mod(mod_name, ai_cfg,
+                              game_version=args.game_version,
+                              lang=args.lang, verbose=args.verbose)
+        if not chapter:
+            print(f"Failed to regenerate {mod_name}.", file=sys.stderr)
+            sys.exit(1)
+        if idx >= 0:
+            existing_root["chapters"][idx] = chapter
+            print(f"Replaced chapter for: {mod_name}")
+        else:
+            existing_root["chapters"].append(chapter)
+            print(f"Appended new chapter for: {mod_name}")
+        out_file, html_out = write_outputs(existing_root, output_dir)
+        print(f"\nUpdated: {out_file}\nPreview: {html_out}")
+        sys.exit(0)
+
+    mods = collect_mods(args)
+
+    if args.analyze:
+        mods = cmd_analyze(args, mods)
+        if not mods:
+            print("Nothing selected. Exiting.")
+            sys.exit(0)
 
     if not mods:
         print("No mods specified. Use -m 'Mod Name' or --mods-file mods.txt")
@@ -254,14 +440,30 @@ def main() -> None:
         print("⚠  No API keys configured. Run: python mc_quest_gen.py --setup")
         sys.exit(1)
 
-    output_dir = Path(args.output)
+    is_append = args.append or (existing_root is not None and not args.regenerate_mod)
+    existing_names: list[str] = []
+    if existing_root and is_append:
+        existing_names = [n.lower() for n in existing_mods(existing_root)]
+        before = len(mods)
+        mods = [m for m in mods if m.lower() not in existing_names]
+        if before != len(mods):
+            print(f"  (skipping {before - len(mods)} mods already in {quests_json_path(output_dir)})")
+
+    if not mods:
+        if existing_root:
+            print("\nAll requested mods are already in the config — nothing to do.")
+            print("Use --regenerate-mod 'Mod Name' to redo one, or pass new mods.")
+            sys.exit(0)
+        print("No new mods to process.")
+        sys.exit(0)
+
     print(f"\nMC Quest Generator")
-    print(f"  mods    : {len(mods)}")
+    print(f"  mods    : {len(mods)} {'(appending)' if existing_root else ''}")
     print(f"  output  : {output_dir.resolve()}")
     print(f"  version : {args.game_version}")
     print(f"  lang    : {args.lang}\n")
 
-    chapters: list[dict] = []
+    new_chapters: list[dict] = []
     failed: list[tuple[str, str]] = []
 
     for mod_name in mods:
@@ -274,7 +476,7 @@ def main() -> None:
                 verbose=args.verbose,
             )
             if chapter:
-                chapters.append(chapter)
+                new_chapters.append(chapter)
             else:
                 failed.append((mod_name, "no quests parsed"))
         except RuntimeError as e:
@@ -289,20 +491,30 @@ def main() -> None:
             failed.append((mod_name, f"{type(e).__name__}: {e}"))
         time.sleep(0.4)
 
-    if not chapters:
+    if not new_chapters and not existing_root:
         print("\nx No chapters generated.")
         if failed:
             for name, err in failed:
                 print(f"  - {name}: {err}")
         sys.exit(1)
 
-    root = ftbquests.make_root_json(chapters)
-    out_file = ftbquests.write_ftbquests_output(root, output_dir)
+    if existing_root:
+        root = existing_root
+        root["chapters"].extend(new_chapters)
+    else:
+        root = ftbquests.make_root_json(new_chapters)
 
-    total_quests = sum(len(c["quests"]) for c in chapters)
+    out_file, html_out = write_outputs(root, output_dir)
+
+    total_quests = sum(len(c["quests"]) for c in root["chapters"])
     print(f"\n{'=' * 60}")
-    print(f"Done. {total_quests} quests across {len(chapters)} chapter(s).")
-    print(f"Output: {out_file}")
+    if existing_root:
+        print(f"Done. +{sum(len(c['quests']) for c in new_chapters)} new quests appended.")
+        print(f"      Total: {total_quests} quests across {len(root['chapters'])} chapter(s).")
+    else:
+        print(f"Done. {total_quests} quests across {len(root['chapters'])} chapter(s).")
+    print(f"Output : {out_file}")
+    print(f"Preview: {html_out}  (open in any browser)")
     print()
     print("Install:")
     print(f"  copy  {output_dir}/config/ftbquests/")
