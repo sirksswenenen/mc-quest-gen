@@ -14,7 +14,12 @@ The AI receives mod metadata from Modrinth + a wiki excerpt + curated progressio
 - Quests linked in a dependency tree (left → right)
 - **No rewards** — this is a progression cheat-sheet, not a hardcore questbook
 - 9 pluggable AI providers with automatic fallback (Cloudflare is the *last* one, opt-in)
+- **HTML preview** auto-generated next to the JSON — sidebar with mod chapters, clickable quest nodes with icons, dependency lines (no install required, just open in a browser)
+- **Mod analyzer** with score-based recommendations (★★★ = perfect for quest generation)
+- **Incremental updates** — `--append` adds new mods to an existing `quests.json` without regenerating old chapters; `--regenerate-mod` redoes a single chapter
 - No 3rd-party Python deps — stdlib only
+
+![Preview screenshot](preview_screenshot.png)
 
 ### Install
 
@@ -66,6 +71,27 @@ python mc_quest_gen.py -m "Mekanism" -o ./my_modpack
 
 # See AI raw output + which provider was used
 python mc_quest_gen.py -m "Botania" --verbose
+
+# Analyze + interactively pick which mods to generate
+python mc_quest_gen.py --analyze --mods-file mods.txt
+
+# Analyze a folder of .jar files (auto-discovers mod names)
+python mc_quest_gen.py --analyze --scan-dir /path/to/minecraft/mods
+
+# Auto-pick top 10 best-scored mods, skip the prompt
+python mc_quest_gen.py --analyze --top 10 --mods-file mods.txt
+
+# List which mods are already present in an existing config
+python mc_quest_gen.py --list-mods -o ./my_modpack
+
+# Add new mods to an existing quests.json (skips mods already there)
+python mc_quest_gen.py --append -m "Botania" "Thaumcraft" -o ./my_modpack
+
+# Redo a single chapter (replaces the old one in place)
+python mc_quest_gen.py --regenerate-mod "IC2" -o ./my_modpack
+
+# Just rerender the HTML preview for an existing quests.json
+python mc_quest_gen.py --html ./my_modpack/config/ftbquests/quests.json
 ```
 
 ### Example `mods.txt`
@@ -88,6 +114,7 @@ Tinkers Construct
 
 ```
 mc_quests_output/
+├── preview.html          ← standalone visual preview (open in any browser)
 └── config/
     └── ftbquests/
         ├── quests.json   ← main file (drop into your instance)
@@ -96,6 +123,8 @@ mc_quests_output/
 
 Copy `config/ftbquests/` into your Minecraft instance. In-game: `/ftbquests editing_mode`.
 
+The `preview.html` is **self-contained** (no install, no server) — open it locally and you get a dark-themed FTB-Quests-style UI: left sidebar with mod chapters and icons, center canvas with hexagonal quest nodes connected by dependency lines, click any quest for full description + task items.
+
 ### Architecture
 
 ```
@@ -103,6 +132,8 @@ mc_quest_gen.py        ← CLI entry point, AI prompt builder
 providers.py           ← 9 AI providers + fallback chain + diagnostics
 scraper.py             ← Modrinth + FTB Wiki + Minecraft Wiki + curated stages
 ftbquests.py           ← 1.12.2 JSON format generator + layout + parser
+html_visualizer.py     ← preview.html renderer (sidebar + canvas + icons)
+analyzer.py            ← mod scoring + interactive selection
 providers_config.json  ← your API keys (created by --setup, gitignored)
 ```
 
@@ -133,7 +164,12 @@ MIT
 - Квесты связаны в дерево зависимостей (слева направо)
 - **Без наград** — это шпаргалка по прогрессии, а не хардкорный гайдбук
 - 9 ИИ-провайдеров с автофолбеком (Cloudflare — в конце цепочки, опционально)
+- **HTML-превью** автоматически создаётся рядом с JSON — sidebar с модами, кликабельные шестигранники квестов с иконками, линии зависимостей (никаких установок, открой в браузере)
+- **Анализатор модов** со score-рекомендациями (★★★ = идеально для квест-генерации)
+- **Инкрементальные обновления** — `--append` дополняет существующий `quests.json` новыми модами без перегенерации старых; `--regenerate-mod` пересобирает одну главу
 - Никаких внешних Python-зависимостей — только stdlib
+
+![Превью](preview_screenshot.png)
 
 ### Установка
 
@@ -185,6 +221,27 @@ python mc_quest_gen.py -m "Mekanism" -o ./my_modpack
 
 # Подробный режим — видно сырой ответ ИИ и какой провайдер сработал
 python mc_quest_gen.py -m "Botania" --verbose
+
+# Проанализировать список модов и интерактивно выбрать
+python mc_quest_gen.py --analyze --mods-file mods.txt
+
+# Просканировать папку с .jar-файлами (имена модов угадываются автоматически)
+python mc_quest_gen.py --analyze --scan-dir /path/to/minecraft/mods
+
+# Авто-выбрать топ-10 лучших по скору, без интерактива
+python mc_quest_gen.py --analyze --top 10 --mods-file mods.txt
+
+# Посмотреть, какие моды уже есть в существующем конфиге
+python mc_quest_gen.py --list-mods -o ./my_modpack
+
+# Добавить новые моды в существующий quests.json (старые не трогаются)
+python mc_quest_gen.py --append -m "Botania" "Thaumcraft" -o ./my_modpack
+
+# Переделать одну конкретную главу (старая удаляется, новая встаёт на её место)
+python mc_quest_gen.py --regenerate-mod "IC2" -o ./my_modpack
+
+# Просто перерисовать preview.html для существующего quests.json
+python mc_quest_gen.py --html ./my_modpack/config/ftbquests/quests.json
 ```
 
 ### Пример `mods.txt`
@@ -207,6 +264,7 @@ Tinkers Construct
 
 ```
 mc_quests_output/
+├── preview.html          ← автономное визуальное превью (открой в любом браузере)
 └── config/
     └── ftbquests/
         ├── quests.json   ← главный файл (брось в сборку)
@@ -215,6 +273,8 @@ mc_quests_output/
 
 Скопируй `config/ftbquests/` в папку Minecraft-инстанса. В игре: `/ftbquests editing_mode`.
 
+`preview.html` — **самодостаточный** (никаких установок, никаких серверов): открываешь локально и получаешь тёмный UI в стиле FTB Quests — слева sidebar с модами и иконками, в центре канвас с шестигранными квест-нодами, соединёнными линиями зависимостей; клик по квесту → полное описание + предметы-таски.
+
 ### Архитектура
 
 ```
@@ -222,6 +282,8 @@ mc_quest_gen.py        ← CLI, сборщик промптов для ИИ
 providers.py           ← 9 ИИ-провайдеров + цепочка фолбека + диагностика
 scraper.py             ← Modrinth + FTB Wiki + Minecraft Wiki + встроенные стадии
 ftbquests.py           ← Генератор JSON под 1.12.2 + раскладка + парсер
+html_visualizer.py     ← Рендер preview.html (sidebar + канвас + иконки)
+analyzer.py            ← Скоринг модов + интерактивный выбор
 providers_config.json  ← Твои ключи (создаётся через --setup, в .gitignore)
 ```
 
