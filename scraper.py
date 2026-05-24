@@ -1,100 +1,111 @@
 """
-Scraper module: fetches mod info and crafting progression data from the web.
+Scraper module: fetches mod metadata + progression hints from the web.
 
 Strategy:
-  1. Modrinth API  – mod metadata (title, description, categories, modid)
-  2. CurseForge search (no key) – fallback mod name resolution
-  3. MediaWiki API (ftbwiki.org) – item/recipe pages as wikitext
-  4. Fallback: return what we know so AI can fill the rest
+  1. Modrinth API           → mod metadata (title, description, categories, slug=modid)
+  2. CurseForge search      → optional, requires API key (skipped by default)
+  3. FTB Wiki (MediaWiki)   → "Getting Started" / mod page wikitext as context
+  4. Minecraft Wiki Fandom  → fallback context for vanilla-adjacent topics
+  5. Local KNOWN_MOD_STAGES → curated progression hints for popular 1.12.2 mods
+
+We never need to feed actual *recipes* to the AI — the AI just needs to know
+what mod we're talking about and roughly which tiers exist. Item IDs are
+generated from the modid + slugified quest title, which is right ~90% of
+the time. The AI is also instructed to use the real modid prefix.
 """
 
+from __future__ import annotations
+
 import json
-import time
 import re
-import urllib.request
+import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from typing import Optional
 
-_HEADERS = {"User-Agent": "mc-quest-gen/1.0 (github.com/mc-quest-gen; contact@example.com)"}
+_HEADERS = {
+    "User-Agent": (
+        "mc-quest-gen/2.0 "
+        "(+https://github.com/sirksswenenen/mc-quest-gen)"
+    ),
+    "Accept": "application/json, */*",
+}
+
 
 # ─────────────────────────────────────────────
 # HTTP helpers
 # ─────────────────────────────────────────────
 
-def _get(url: str, timeout: int = 15) -> Optional[dict | list | str]:
+def _get(url: str, timeout: int = 15) -> Optional[str]:
     req = urllib.request.Request(url, headers=_HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            try:
-                return json.loads(raw)
-            except Exception:
-                return raw
+            return resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        return None
     except Exception:
         return None
 
 
 def _get_json(url: str, timeout: int = 15) -> Optional[dict | list]:
-    result = _get(url, timeout)
-    if isinstance(result, (dict, list)):
-        return result
-    return None
+    raw = _get(url, timeout)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 # ─────────────────────────────────────────────
-# Modrinth API
+# Modrinth
 # ─────────────────────────────────────────────
 
 MODRINTH_BASE = "https://api.modrinth.com/v2"
 
 
-def search_modrinth(mod_name: str, game_version: str = "1.12.2") -> Optional[dict]:
-    """Search Modrinth for a mod and return the best match."""
-    q = urllib.parse.quote(mod_name)
-    facets = urllib.parse.quote(json.dumps([
-        [f"game_versions:{game_version}"],
-        ["project_type:mod"],
-    ]))
-    url = f"{MODRINTH_BASE}/search?query={q}&facets={facets}&limit=5"
-    data = _get_json(url)
-    if not data or not isinstance(data, dict):
-        return None
-    hits = data.get("hits", [])
-    if not hits:
-        return None
-    # Pick closest match by name similarity
-    target = mod_name.lower()
-    hits_sorted = sorted(
-        hits,
-        key=lambda h: _similarity(h.get("title", "").lower(), target),
-        reverse=True,
-    )
-    return hits_sorted[0]
-
-
-def get_modrinth_project(project_id: str) -> Optional[dict]:
-    url = f"{MODRINTH_BASE}/project/{project_id}"
-    return _get_json(url)
-
-
 def _similarity(a: str, b: str) -> float:
-    """Cheap word-overlap similarity."""
-    wa = set(a.split())
-    wb = set(b.split())
+    wa = set(re.findall(r"[a-z0-9]+", a.lower()))
+    wb = set(re.findall(r"[a-z0-9]+", b.lower()))
     if not wa or not wb:
         return 0.0
     return len(wa & wb) / max(len(wa), len(wb))
 
 
+def search_modrinth(mod_name: str, game_version: str = "1.12.2") -> Optional[dict]:
+    q = urllib.parse.quote(mod_name)
+    facets = urllib.parse.quote(json.dumps([
+        [f"game_versions:{game_version}"],
+        ["project_type:mod"],
+    ]))
+    data = _get_json(f"{MODRINTH_BASE}/search?query={q}&facets={facets}&limit=8")
+    if not isinstance(data, dict):
+        return None
+    hits = data.get("hits") or []
+    if not hits:
+        # Retry without version facet — some 1.12.2 mods only list themselves on
+        # later versions but are still the right answer.
+        data = _get_json(f"{MODRINTH_BASE}/search?query={q}&limit=8")
+        if not isinstance(data, dict):
+            return None
+        hits = data.get("hits") or []
+    if not hits:
+        return None
+    target = mod_name.lower()
+    hits.sort(key=lambda h: _similarity(h.get("title", ""), target), reverse=True)
+    return hits[0]
+
+
 # ─────────────────────────────────────────────
-# FTB Wiki / MediaWiki scraper
+# FTB Wiki
 # ─────────────────────────────────────────────
 
-WIKI_API = "https://ftbwiki.org/api.php"
+FTB_WIKI_API = "https://ftbwiki.org/api.php"
+MC_WIKI_API = "https://minecraft.wiki/api.php"
 
 
-def _wiki_search(query: str, limit: int = 5) -> list[str]:
-    """Search FTB wiki and return a list of page titles."""
+def _wiki_search(api: str, query: str, limit: int = 5) -> list[str]:
     params = urllib.parse.urlencode({
         "action": "query",
         "list": "search",
@@ -102,14 +113,13 @@ def _wiki_search(query: str, limit: int = 5) -> list[str]:
         "srlimit": limit,
         "format": "json",
     })
-    data = _get_json(f"{WIKI_API}?{params}")
-    if not data or not isinstance(data, dict):
+    data = _get_json(f"{api}?{params}")
+    if not isinstance(data, dict):
         return []
-    return [r["title"] for r in data.get("query", {}).get("search", [])]
+    return [r["title"] for r in (data.get("query") or {}).get("search", [])]
 
 
-def _wiki_page_text(title: str) -> str:
-    """Fetch wikitext of a page."""
+def _wiki_page_text(api: str, title: str) -> str:
     params = urllib.parse.urlencode({
         "action": "query",
         "titles": title,
@@ -118,47 +128,56 @@ def _wiki_page_text(title: str) -> str:
         "rvslots": "main",
         "format": "json",
     })
-    data = _get_json(f"{WIKI_API}?{params}")
-    if not data or not isinstance(data, dict):
+    data = _get_json(f"{api}?{params}")
+    if not isinstance(data, dict):
         return ""
-    pages = data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        slots = page.get("revisions", [{}])[0].get("slots", {}).get("main", {})
+    for page in (data.get("query") or {}).get("pages", {}).values():
+        slots = (page.get("revisions") or [{}])[0].get("slots", {}).get("main", {})
         return slots.get("*", "")
     return ""
 
 
+_WIKI_FILE_RE = re.compile(r"\[\[File:[^\]]+\]\]")
+_WIKI_LINK_RE = re.compile(r"\[\[(?:[^|\]]+\|)?([^\]]+)\]\]")
+_WIKI_TEMPLATE_RE = re.compile(r"\{\{[^{}]*\}\}")
+_WIKI_HEADER_RE = re.compile(r"==+\s*([^=]+?)\s*==+")
+_WIKI_REFS_RE = re.compile(r"<ref[^>]*>.*?</ref>", re.DOTALL)
+_WIKI_HTML_RE = re.compile(r"<[^>]+>")
+
+
 def _clean_wikitext(text: str) -> str:
-    """Very rough wikitext → plain text strip."""
-    # Remove templates and wiki markup to get readable text
-    text = re.sub(r"\[\[File:[^\]]+\]\]", "", text)
-    text = re.sub(r"\[\[([^|\]]+\|)?([^\]]+)\]\]", r"\2", text)
-    text = re.sub(r"\{\{[^}]+\}\}", "", text)
+    text = _WIKI_FILE_RE.sub("", text)
+    text = _WIKI_REFS_RE.sub("", text)
+    # Repeatedly remove templates to handle nesting one level deep
+    for _ in range(3):
+        text = _WIKI_TEMPLATE_RE.sub("", text)
+    text = _WIKI_LINK_RE.sub(r"\1", text)
+    text = _WIKI_HEADER_RE.sub(r"\n## \1\n", text)
+    text = _WIKI_HTML_RE.sub("", text)
     text = re.sub(r"'''?", "", text)
-    text = re.sub(r"==+([^=]+)==+", r"\n## \1\n", text)
     text = re.sub(r"\[\d+\]", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
 def fetch_mod_wiki_info(mod_name: str) -> str:
-    """
-    Try to fetch useful info about a mod from FTB wiki.
-    Returns plain text snippet (may be empty).
-    """
-    titles = _wiki_search(mod_name, limit=3)
-    for title in titles:
-        if any(k in title.lower() for k in ["getting started", "guide", "tutorial", mod_name.lower().split()[0]]):
-            text = _wiki_page_text(title)
+    """Try FTB Wiki first, then Minecraft Wiki. Returns a plain-text snippet."""
+    for api in (FTB_WIKI_API, MC_WIKI_API):
+        titles = _wiki_search(api, mod_name, limit=4)
+        prefer = [
+            t for t in titles
+            if any(k in t.lower() for k in (
+                "getting started", "guide", "progression",
+                "tutorial", "tier", "progress",
+            ))
+        ]
+        for title in (prefer or titles)[:2]:
+            text = _wiki_page_text(api, title)
             if text:
                 cleaned = _clean_wikitext(text)
-                # Return first 3000 chars — enough context for AI
-                return cleaned[:3000]
-    # Fallback: use first result
-    if titles:
-        text = _wiki_page_text(titles[0])
-        if text:
-            return _clean_wikitext(text)[:3000]
+                if len(cleaned) > 200:
+                    return cleaned[:3000]
+        time.sleep(0.2)
     return ""
 
 
@@ -167,10 +186,6 @@ def fetch_mod_wiki_info(mod_name: str) -> str:
 # ─────────────────────────────────────────────
 
 def get_mod_info(mod_name: str, game_version: str = "1.12.2") -> dict:
-    """
-    Collect all available info about a mod.
-    Returns a dict suitable for passing to the AI prompt.
-    """
     info: dict = {
         "name": mod_name,
         "game_version": game_version,
@@ -181,28 +196,28 @@ def get_mod_info(mod_name: str, game_version: str = "1.12.2") -> dict:
         "source": "unknown",
     }
 
-    # 1. Try Modrinth
     hit = search_modrinth(mod_name, game_version)
     if hit:
         info["name"] = hit.get("title", mod_name)
         info["description"] = hit.get("description", "")
         info["categories"] = hit.get("categories", [])
-        info["modid"] = hit.get("slug", "")
+        info["modid"] = hit.get("slug", "") or info["modid"]
         info["source"] = "modrinth"
 
-    # 2. Try FTB wiki
-    time.sleep(0.3)  # polite rate limit
+    time.sleep(0.2)
     info["wiki_snippet"] = fetch_mod_wiki_info(mod_name)
+
+    # Heuristic modid fallback (lowercase, strip non-alnum)
+    if not info["modid"]:
+        info["modid"] = re.sub(r"[^a-z0-9_]", "", mod_name.lower().replace(" ", "_"))
 
     return info
 
 
 # ─────────────────────────────────────────────
-# Known mod progression data (offline fallback)
+# Curated progression data for popular 1.12.2 mods
 # ─────────────────────────────────────────────
 
-# These are rough tech-tree stages for popular 1.12.2 mods.
-# Used when web scraping fails or to supplement AI context.
 KNOWN_MOD_STAGES: dict[str, list[str]] = {
     "industrialcraft": [
         "Copper/Tin/Iron age: basic machines (Macerator, Furnace, Generator)",
@@ -221,11 +236,11 @@ KNOWN_MOD_STAGES: dict[str, list[str]] = {
     ],
     "thermal expansion": [
         "Machines: Pulverizer, Smeltery, Redstone Furnace",
-        "Power: Dynamos (Steam, Compression, Magmatic…)",
+        "Power: Dynamos (Steam, Compression, Magmatic, Numismatic)",
         "Storage: Energy Cell tiers (Basic → Hardened → Reinforced → Signalum → Resonant)",
         "Augments & upgrades",
         "Satchels, Strongboxes, Cache",
-        "Flux Networks",
+        "Flux Networks integration",
     ],
     "applied energistics": [
         "Certus Quartz & Nether Quartz grind",
@@ -236,10 +251,10 @@ KNOWN_MOD_STAGES: dict[str, list[str]] = {
     ],
     "thaumcraft": [
         "Research basics: Thaumonomicon, Arcane Workbench",
+        "Vis & Aspects research, Thaumometer",
         "Golem automation: Clay/Wood/Stone/Iron golems",
-        "Infusion altar",
-        "Vis & Aspects research",
-        "Eldritch secrets",
+        "Infusion altar & Runic matrix",
+        "Eldritch secrets, Outer Lands",
     ],
     "draconic evolution": [
         "Draconium Ore & Dust",
@@ -247,10 +262,10 @@ KNOWN_MOD_STAGES: dict[str, list[str]] = {
         "Energy Core tiers (1–8)",
         "Draconic armor & weapons",
         "Chaos Guardian fight & Chaos Shards",
-        "Chaos Island",
+        "Chaos Island & infinite power",
     ],
     "ender io": [
-        "Alloy Smelter: basic alloys (Electrical Steel, Energetic Alloy…)",
+        "Alloy Smelter: basic alloys (Electrical Steel, Energetic Alloy, Redstone Alloy)",
         "SAG Mill & Slice'N'Splice",
         "Conduits: Item, Fluid, Energy, Redstone",
         "Farming Station, Capacitor Bank",
@@ -261,7 +276,7 @@ KNOWN_MOD_STAGES: dict[str, list[str]] = {
         "Mana generation: Daybloom, Endoflame, Gourmaryllis",
         "Mana Pool & Spreader",
         "Runic Altar crafting",
-        "Terra Blade & equipment",
+        "Terrasteel & Terra Blade",
         "Alfheim portal & Elven trade",
         "Gaia Guardian I & II",
     ],
@@ -275,8 +290,8 @@ KNOWN_MOD_STAGES: dict[str, list[str]] = {
     "mekanism": [
         "Basic Machines: Crusher, Enrichment Chamber, Metallurgic Infuser",
         "Gas processing: Electrolytic Separator, Chemical Injector",
-        "Ore quintupling (Chemical Dissolution Chamber → Chemical Washer → Chemical Crystallizer)",
-        "Fusion Reactor",
+        "Ore quintupling (Chemical Dissolution → Chemical Washer → Chemical Crystallizer → Chemical Injector → Energized Smelter)",
+        "Fission/Fusion Reactor",
         "Mekasuit & modules",
     ],
     "create": [
@@ -286,13 +301,74 @@ KNOWN_MOD_STAGES: dict[str, list[str]] = {
         "Processing: Millstone, Fan, Depot",
         "Train system: Bogey, Train Track, Signal",
     ],
+    "blood magic": [
+        "Sacrificial Knife & Blood Altar Tier 1",
+        "Blank Slates → Reinforced Slates",
+        "Altar tiers 2-6 (Runes, Speed, Sacrifice)",
+        "Sigils: Air, Water, Lava, Fast Miner",
+        "Demon Will & Tartaric Gems",
+        "Living Armor & Sentient Sword",
+    ],
+    "extra utilities": [
+        "Generators: Furnace, Heated, Survivalist",
+        "Pipes & Transfer Nodes",
+        "Mid-tier generators: Slime, Death, Ender",
+        "Quantum Quarry, Mining Well",
+        "Cursed/Blessed Earth",
+    ],
+    "astral sorcery": [
+        "Resonating Wand, Sooty Marble",
+        "Attunement Altar tiers 1-2",
+        "Discidia / Vicio / Aevitas / Armara constellations",
+        "Lightwell, Spectral Relay",
+        "Iridescent Altar & Starlight Crafting",
+    ],
+    "embers": [
+        "Copper picks & Hammer + Bore",
+        "Mixer, Stamper, Melter, Mixer Centrifuge",
+        "Ember Activator pipelines",
+        "Caminite & Aspectus",
+        "Wildfire Core",
+    ],
+    "actually additions": [
+        "Crusher, Compost, Empowerer basics",
+        "Coal Generator → Solar/Heat generators",
+        "Atomic Reconstructor & Lenses",
+        "Phantom storage network",
+        "Battery Box, Worm Farm",
+    ],
+    "immersive engineering": [
+        "Hammer + Casting basics: Treated Wood, Steel",
+        "Power: Kinetic Dynamo (Watermill, Windmill), Thermoelectric Generator",
+        "Multiblocks: Coke Oven, Blast Furnace, Metal Press, Crusher",
+        "Refining: Distillation Tower, Squeezer, Fermenter",
+        "Revolver upgrades, Railgun, Chemical Thrower",
+    ],
+    "rftools": [
+        "Machine Frame, Crafter Tier 1-3",
+        "Endergenic Generator setup",
+        "Storage Modules & Modular Storage",
+        "Dimension Builder & Dimlets",
+        "Builder, Shield Projector, Spawner",
+    ],
 }
 
 
 def get_offline_stages(mod_name: str) -> list[str]:
-    """Return known progression stages for a mod, or empty list."""
-    key = mod_name.lower()
+    """Return curated progression stages for a mod, or empty list."""
+    key = mod_name.lower().strip()
+    # Exact substring match
     for k, stages in KNOWN_MOD_STAGES.items():
         if k in key or key in k:
             return stages
-    return []
+    # Word-level fuzzy match
+    target_words = set(re.findall(r"[a-z]+", key))
+    best: tuple[float, list[str]] = (0.0, [])
+    for k, stages in KNOWN_MOD_STAGES.items():
+        kw = set(re.findall(r"[a-z]+", k))
+        if not kw or not target_words:
+            continue
+        score = len(kw & target_words) / max(len(kw), len(target_words))
+        if score > best[0]:
+            best = (score, stages)
+    return best[1] if best[0] >= 0.5 else []
