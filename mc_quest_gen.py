@@ -290,10 +290,13 @@ def _print_test_results(results: dict) -> None:
         print(f"  {icon} {name:<{width}}  {status}")
 
 
-def collect_mods(args: argparse.Namespace) -> list[str]:
-    mods: list[str] = []
+def collect_mods(args: argparse.Namespace) -> list[tuple[str, str, str]]:
+    """Returns (display_name, modid, filename) tuples.
+    For -m / --mods-file entries, modid and filename are empty."""
+    items: list[tuple[str, str, str]] = []
     if args.mods:
-        mods.extend(args.mods)
+        for m in args.mods:
+            items.append((m, "", ""))
     if args.mods_file:
         path = Path(args.mods_file)
         if not path.exists():
@@ -302,21 +305,22 @@ def collect_mods(args: argparse.Namespace) -> list[str]:
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
-                mods.append(line)
+                items.append((line, "", ""))
     if args.scan_dir:
         d = Path(args.scan_dir)
         discovered = analyzer.discover_mods_from_directory(d)
         if not discovered:
             print(f"Warning: no .jar files found in {d}", file=sys.stderr)
-        mods.extend(discovered)
-    # Dedupe preserving order
+        items.extend(discovered)
+    # Dedupe by lowercase display name preserving order
     seen = set()
-    out = []
-    for m in mods:
-        key = m.lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(m)
+    out: list[tuple[str, str, str]] = []
+    for name, modid, file in items:
+        key = (name or modid).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append((name, modid, file))
     return out
 
 
@@ -348,14 +352,13 @@ def cmd_list_mods(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_analyze(args: argparse.Namespace, mods: list[str]) -> list[str]:
-    if not mods:
+def cmd_analyze(args: argparse.Namespace, items: list[tuple[str, str, str]]) -> list[str]:
+    if not items:
         print("Error: --analyze needs a mod list (use -m, --mods-file, or --scan-dir).",
               file=sys.stderr)
         sys.exit(1)
-    print(f"\nAnalyzing {len(mods)} mod(s)…")
-    results = analyzer.analyze_mods(mods)
-    analyzer.print_analysis_table(results)
+    print(f"\nAnalyzing {len(items)} mod(s)…")
+    results = analyzer.analyze_mods(items)
     if args.top is not None:
         sorted_res = sorted(results, key=lambda r: (-r.score, r.name.lower()))
         chosen = [r.name for r in sorted_res[: args.top]]
@@ -418,13 +421,15 @@ def main() -> None:
         print(f"\nUpdated: {out_file}\nPreview: {html_out}")
         sys.exit(0)
 
-    mods = collect_mods(args)
+    items = collect_mods(args)
 
     if args.analyze:
-        mods = cmd_analyze(args, mods)
+        mods = cmd_analyze(args, items)
         if not mods:
             print("Nothing selected. Exiting.")
             sys.exit(0)
+    else:
+        mods = [name for name, _modid, _file in items]
 
     if not mods:
         print("No mods specified. Use -m 'Mod Name' or --mods-file mods.txt")
