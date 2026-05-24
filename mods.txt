@@ -1,0 +1,19 @@
+# MC Quest Generator - список модов
+# Один мод на строку, строки с # игнорируются
+
+# Технология
+Thermal Expansion
+IC2
+Applied Energistics 2
+Ender IO
+Mekanism
+
+# Магия
+Botania
+Thaumcraft
+
+# Эндгейм
+Draconic Evolution
+
+# Инструменты
+Tinkers Construct

@@ -1,0 +1,10 @@
+providers_config.json
+__pycache__/
+*.pyc
+*.pyo
+.env
+mc_quests_output/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
