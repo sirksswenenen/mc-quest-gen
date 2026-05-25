@@ -38,6 +38,7 @@ from pathlib import Path
 import analyzer
 import ftbquests
 import html_visualizer
+import jar_inventory
 import providers
 import scraper
 
@@ -52,7 +53,6 @@ Your task: generate a quest chain (progression cheat-sheet) for a given mod.
 Rules:
 - Each quest = ONE crafting / progression milestone in the mod's tech tree.
 - Start from the very beginning (basic resources) and walk up to end-game.
-- 8–18 quests per mod, roughly sorted from easiest to hardest.
 - Each quest MUST follow this EXACT format:
 
 ## Stage N: Quest Title Here
@@ -61,13 +61,20 @@ Description: One or two sentences explaining what this stage is about
 and why it matters in the progression.
 Depends on: Stage N-1 (or "none" for the first quest)
 
-- For "Item:" use a real Minecraft item ID (lowercase, with the modid prefix).
+- For "Item:" you MUST use a real item ID — lowercase, with the modid prefix.
+- **If an "Items present in this mod" list is provided below, you MUST pick
+  every Item: from THAT LIST. Do NOT invent IDs that aren't in the list.**
+  When in doubt between two listed items, prefer the one that better fits the
+  current progression tier.
+- If no inventory list is provided, you may use ids you are confident exist
+  for the named mod — never guess speculative names.
 - If a quest requires multiple items, comma-separate them: Item: modid:item1, modid:item2
 - Keep quest titles concise (≤ 8 words).
 - Keep descriptions informative but short (1-3 sentences).
 - Do NOT add rewards or any extra fields — JUST the format above.
 - Do NOT add intro/outro text or markdown outside the ## Stage blocks.
 - Do NOT use <think>...</think>; write the final answer directly.
+- The required quest count is given as "Target quest count" below — honor it.
 """
 
 SYSTEM_PROMPT_RU = """Ты — эксперт по созданию Minecraft-модпаков для версии 1.12.2.
@@ -76,7 +83,6 @@ SYSTEM_PROMPT_RU = """Ты — эксперт по созданию Minecraft-м
 Правила:
 - Каждый квест = ОДИН этап крафта / прогрессии в тех-дереве мода.
 - Начни с самого начала (базовые ресурсы) и иди до эндгейма.
-- 8–18 квестов на мод, от простого к сложному.
 - Каждый квест СТРОГО в таком формате:
 
 ## Этап N: Название квеста
@@ -84,17 +90,46 @@ Item: modid:item_id
 Description: Одно-два предложения — что нужно сделать и зачем это важно.
 Depends on: Этап N-1 (или "none" для первого)
 
-- В поле "Item:" — реальный ID предмета Minecraft (строчные буквы, с modid).
+- В поле "Item:" ты ОБЯЗАН использовать реальный ID предмета (строчные буквы, с modid).
+- **Если ниже дан список "Items present in this mod", ты ОБЯЗАН брать
+  каждый "Item:" ИЗ ЭТОГО СПИСКА. НЕ придумывай ID, которых в нём нет.**
+  Если выбираешь между двумя элементами списка — бери тот, который лучше подходит
+  этому этапу прогрессии.
+- Если списка нет — используй только те ID, в существовании которых уверен. Никаких догадок.
 - Если квест требует несколько предметов: Item: modid:item1, modid:item2
 - Название квеста — не длиннее 8 слов.
 - Описание — короткое и информативное (1-3 предложения).
 - НЕ добавляй награды, поля или комментарии вне блоков.
 - НЕ добавляй текста до/после блоков ## Этап.
 - НЕ используй <think>...</think> — пиши финальный ответ сразу.
+- Обязательное количество квестов — в поле "Target quest count" ниже.
 """
 
 
-def build_prompt(mod_info: dict, offline_stages: list[str], lang: str = "en") -> list[dict]:
+def _target_quest_count(inventory_size: int) -> tuple[int, int]:
+    """Scale the quest target by mod size so big mods get a fuller treatment.
+
+    Returns (min_quests, max_quests).
+    """
+    if inventory_size <= 0:
+        return (8, 14)               # unknown size — conservative
+    if inventory_size < 20:
+        return (6, 10)
+    if inventory_size < 60:
+        return (10, 16)
+    if inventory_size < 150:
+        return (16, 26)
+    if inventory_size < 300:
+        return (24, 38)
+    return (32, 50)
+
+
+def build_prompt(
+    mod_info: dict,
+    offline_stages: list[str],
+    lang: str = "en",
+    inventory_summary: dict | None = None,
+) -> list[dict]:
     system = SYSTEM_PROMPT_RU if lang == "ru" else SYSTEM_PROMPT_EN
     mod_name = mod_info["name"]
     modid = mod_info.get("modid") or mod_name.lower().replace(" ", "")
@@ -107,16 +142,48 @@ def build_prompt(mod_info: dict, offline_stages: list[str], lang: str = "en") ->
         user_parts.append(f"Categories: {categories}")
     if description:
         user_parts.append(f"Short description: {description[:400]}")
+
+    inv_lines: list[str] = []
+    inv_total = 0
+    if inventory_summary:
+        inv_lines = inventory_summary.get("inventory_lines", []) or []
+        inv_total = inventory_summary.get("inventory_total", len(inv_lines))
+
+    qmin, qmax = _target_quest_count(inv_total or (len(inv_lines) or 0))
+    user_parts.append(f"Target quest count: {qmin}–{qmax} (cover as much of the mod as possible)")
+
+    if inv_lines:
+        header = (
+            f"Items present in this mod ({inv_total} total"
+            + (", truncated to first {} below".format(len(inv_lines))
+               if inventory_summary and inventory_summary.get("inventory_truncated") else "")
+            + ") — PICK Item: VALUES ONLY FROM THIS LIST:"
+        )
+        user_parts.append(header + "\n" + "\n".join(inv_lines))
+
+    if inventory_summary and inventory_summary.get("patchouli_used"):
+        po = inventory_summary.get("patchouli_outline") or []
+        if po:
+            user_parts.append(
+                "Mod author's official progression outline (Patchouli book — use as a backbone):\n"
+                + "\n".join(po)
+            )
+
     if offline_stages:
         bullets = "\n".join(f"  - {s}" for s in offline_stages)
-        user_parts.append(f"Known progression tiers (use these as a backbone):\n{bullets}")
+        user_parts.append(f"Known progression tiers (curated hint):\n{bullets}")
     if wiki:
         user_parts.append(f"Wiki excerpt:\n{wiki[:1200]}")
 
     if lang == "ru":
-        user_parts.append("\nСгенерируй полную цепочку квестов для этого мода.")
+        user_parts.append(
+            "\nСгенерируй полную цепочку квестов для этого мода в рамках указанного диапазона количества."
+        )
     else:
-        user_parts.append("\nGenerate the complete quest chain for this mod.")
+        user_parts.append(
+            "\nGenerate the complete quest chain for this mod — honor the"
+            " target quest count and the inventory list above."
+        )
 
     return [
         {"role": "system", "content": system},
@@ -128,6 +195,60 @@ def build_prompt(mod_info: dict, offline_stages: list[str], lang: str = "en") ->
 # Per-mod processing
 # ─────────────────────────────────────────────
 
+def _validate_quest_items(quests: list[dict], modid: str, jar_path: str) -> None:
+    """For each quest's task items, warn (and best-effort fix) AI hallucinations.
+
+    "Real" items are those that appeared anywhere in the jar inventory
+    (recipe outputs, lang-derived display ids, blockstates, or referenced
+    inside Patchouli pages). If an AI-emitted id isn't real and a single
+    close match exists, swap in the real one; otherwise leave it and log.
+    """
+    import difflib
+    inv = jar_inventory.inspect_jar(Path(jar_path), modid=modid)
+    if not inv.has_signal():
+        return
+    valid_ids = inv.all_item_ids()
+    # also accept anything referenced inside a Patchouli page (mod author's own list)
+    for book in inv.patchouli_books:
+        for ent in book.entries:
+            valid_ids.update(ent.items)
+            if ent.icon_item:
+                valid_ids.add(ent.icon_item)
+    # everything in 'minecraft:*' is also fine (vanilla items the AI can legitimately pull in)
+    fixed = 0
+    dropped = 0
+    candidates = [iid for iid in valid_ids if iid.startswith(modid + ":")]
+    for q in quests:
+        for task in q.get("tasks", []):
+            iid = task.get("item", "")
+            if not iid or ":" not in iid:
+                continue
+            ns, _name = iid.split(":", 1)
+            if ns == "minecraft":
+                continue
+            if iid in valid_ids:
+                continue
+            # try fuzzy match against same-modid candidates
+            base = iid.split(":", 1)[1]
+            close = difflib.get_close_matches(base, [c.split(":", 1)[1] for c in candidates],
+                                              n=1, cutoff=0.78)
+            if close:
+                new_iid = f"{ns}:{close[0]}"
+                task["item"] = new_iid
+                if "icon" in q and isinstance(q["icon"], dict) and q["icon"].get("item") == iid:
+                    q["icon"]["item"] = new_iid
+                fixed += 1
+            else:
+                dropped += 1
+    if fixed or dropped:
+        msg = []
+        if fixed:
+            msg.append(f"{fixed} item(s) corrected")
+        if dropped:
+            msg.append(f"{dropped} item(s) NOT in jar (kept as-is)")
+        print(f"     · sanity: {', '.join(msg)}")
+
+
 def process_mod(
     mod_name: str,
     ai_cfg: dict,
@@ -135,6 +256,7 @@ def process_mod(
     lang: str = "en",
     verbose: bool = False,
     modid_hint: str = "",
+    jar_path: str = "",
 ) -> dict | None:
     print(f"  - {mod_name}")
 
@@ -142,14 +264,36 @@ def process_mod(
     mod_info = scraper.get_mod_info(mod_name, game_version, modid=modid_hint)
     offline_stages = scraper.get_offline_stages(mod_name)
     src = mod_info.get("source", "unknown")
-    final_modid = mod_info.get("modid") or "?"
+    final_modid = mod_info.get("modid") or modid_hint or "?"
     if src == "unknown":
         print(f" not found online (modid={final_modid})")
     else:
         print(f" done (source={src}, modid={final_modid})")
 
+    # Pull the real item inventory + Patchouli outline straight out of the .jar.
+    # This is what turns the AI from "guesses item names" into "picks from real ids".
+    inventory_summary: dict | None = None
+    if jar_path:
+        jp = Path(jar_path)
+        if jp.exists():
+            print("     · inspecting jar (items + recipes + patchouli)…",
+                  end="", flush=True)
+            inv = jar_inventory.inspect_jar(
+                jp, modid=final_modid if final_modid != "?" else modid_hint or "")
+            inventory_summary = jar_inventory.summarize_for_prompt(inv, max_items=160)
+            n_items = inventory_summary.get("inventory_total", 0)
+            n_patchouli = sum(len(b.entries) for b in inv.patchouli_books)
+            tag = f" {n_items} items"
+            if n_patchouli:
+                tag += f", {n_patchouli} patchouli entries"
+            if not n_items and not n_patchouli:
+                tag = " no extractable inventory (likely Java-registered only)"
+                inventory_summary = None
+            print(f" done ({tag.strip()})")
+
     print("     · asking AI for quest chain…", end="", flush=True)
-    messages = build_prompt(mod_info, offline_stages, lang)
+    messages = build_prompt(mod_info, offline_stages, lang,
+                            inventory_summary=inventory_summary)
     ai_response = providers.ai_call(messages, ai_cfg, verbose=verbose)
     print(f" done ({len(ai_response)} chars)")
 
@@ -165,6 +309,11 @@ def process_mod(
     if not quests:
         print(f"     ! no quests parsed — skipping {mod_name}")
         return None
+
+    # Post-AI sanity check: warn (and best-effort fix) for any item ids the AI
+    # made up that aren't in the real jar inventory.
+    if jar_path and Path(jar_path).exists():
+        _validate_quest_items(quests, modid, jar_path)
 
     icon = "minecraft:book"
     if quests and quests[0].get("tasks"):
@@ -266,6 +415,9 @@ def parse_args() -> argparse.Namespace:
                    help="Regenerate the chapter for ONE specific mod, replacing the old one")
     p.add_argument("--html", metavar="QUESTS_JSON",
                    help="Render a preview.html for an existing quests.json (no AI calls)")
+    p.add_argument("--inspect-jar", metavar="JAR",
+                   help="Debug: dump the recipe/lang/Patchouli inventory of a .jar "
+                        "(verifies what the AI prompt will see)")
     p.add_argument("--html-out", metavar="FILE",
                    help="With --html: explicit output path (default: preview.html next to input)")
     p.add_argument("-m", "--mods", nargs="+", metavar="MOD", help="Mod names")
@@ -346,6 +498,47 @@ def cmd_html_only(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_inspect_jar(args: argparse.Namespace) -> int:
+    """Debug: dump the inventory that would be fed to the AI for one .jar."""
+    jar = Path(args.inspect_jar)
+    if not jar.exists():
+        print(f"Error: file not found: {jar}", file=sys.stderr)
+        return 1
+    meta = analyzer.read_jar_metadata(jar)
+    print(f"Inspecting: {jar}")
+    if meta:
+        print(f"  mod name : {meta.name or '?'}")
+        print(f"  modid    : {meta.modid or '?'}")
+    else:
+        print("  mod name : (mcmod.info / mods.toml not found)")
+    inv = jar_inventory.inspect_jar(jar, modid=(meta.modid if meta else ""))
+    print(f"  modid (sniffed)  : {inv.modid or '?'}")
+    print(f"  recipe outputs   : {len(inv.recipe_outputs)}")
+    print(f"  lang display ids : {len(inv.item_display_names)}")
+    print(f"  blockstate ids   : {len(inv.block_ids)}")
+    print(f"  patchouli books  : {len(inv.patchouli_books)}")
+    summary = jar_inventory.summarize_for_prompt(inv, max_items=200)
+    print(f"  prompt items     : {summary['inventory_total']}"
+          + (" (truncated)" if summary.get("inventory_truncated") else ""))
+    print()
+    print("--- recipe outputs ---")
+    for iid in sorted(inv.recipe_outputs):
+        dn = inv.item_display_names.get(iid, "")
+        print(f"  {iid}   {dn}")
+    print()
+    print("--- lang-derived items ---")
+    for iid in sorted(inv.item_display_names):
+        if iid in inv.recipe_outputs:
+            continue
+        print(f"  {iid}   {inv.item_display_names[iid]}")
+    if inv.patchouli_books:
+        print()
+        print("--- patchouli outline ---")
+        for line in summary.get("patchouli_outline", []):
+            print(line)
+    return 0
+
+
 def cmd_list_mods(args: argparse.Namespace) -> int:
     root = load_existing(Path(args.output))
     if not root:
@@ -411,6 +604,9 @@ def main() -> None:
     if args.html:
         sys.exit(cmd_html_only(args))
 
+    if args.inspect_jar:
+        sys.exit(cmd_inspect_jar(args))
+
     if args.list_mods:
         sys.exit(cmd_list_mods(args))
 
@@ -432,10 +628,20 @@ def main() -> None:
         modid_hint = ""
         if idx >= 0:
             modid_hint = existing_root["chapters"][idx].get("_modid", "") or ""
+        # If --scan-dir is given alongside --regenerate-mod, locate the .jar
+        # so we can extract its real item inventory.
+        jar_path = ""
+        if args.scan_dir:
+            for n, m, f in analyzer.discover_mods_from_directory(Path(args.scan_dir)):
+                if n.lower() == mod_name.lower() or (m and m.lower() == mod_name.lower()):
+                    jar_path = f
+                    if not modid_hint and m:
+                        modid_hint = m
+                    break
         chapter = process_mod(mod_name, ai_cfg,
                               game_version=args.game_version,
                               lang=args.lang, verbose=args.verbose,
-                              modid_hint=modid_hint)
+                              modid_hint=modid_hint, jar_path=jar_path)
         if not chapter:
             print(f"Failed to regenerate {mod_name}.", file=sys.stderr)
             sys.exit(1)
@@ -453,6 +659,9 @@ def main() -> None:
 
     # Map display-name → modid (from jar metadata) so we can pass to process_mod
     modid_map: dict[str, str] = {name: modid for name, modid, _file in items if modid}
+    # Map display-name → jar path so process_mod can inspect the jar contents
+    jar_map: dict[str, str] = {name: file for name, _modid, file in items
+                               if file and file.lower().endswith(".jar")}
 
     if args.analyze:
         mods = cmd_analyze(args, items)
@@ -515,6 +724,7 @@ def main() -> None:
                 lang=args.lang,
                 verbose=args.verbose,
                 modid_hint=modid_map.get(mod_name, ""),
+                jar_path=jar_map.get(mod_name, ""),
             )
             if chapter:
                 new_chapters.append(chapter)
