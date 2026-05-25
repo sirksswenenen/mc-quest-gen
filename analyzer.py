@@ -333,18 +333,23 @@ def analyze_mods(items: list[tuple[str, str, str]], progress: bool = True) -> li
 # ─────────────────────────────────────────────
 
 def discover_mods_from_directory(path: Path) -> list[tuple[str, str, str]]:
-    """Return list of (display_name, modid, filename) for each .jar in `path`."""
+    """Return list of (display_name, modid, jar_path) for each .jar in `path`.
+
+    `jar_path` is the absolute path to the .jar file (as a string), so the
+    rest of the pipeline can re-open it for deeper inspection (recipes,
+    lang files, Patchouli books — see jar_inventory.py)."""
     if not path.exists() or not path.is_dir():
         return []
     out: list[tuple[str, str, str]] = []
     for jar in sorted(path.glob("*.jar")):
         info = read_jar_metadata(jar)
+        full_path = str(jar.resolve())
         if info and (info.name or info.modid):
             display = info.name or info.modid
-            out.append((display, info.modid, jar.name))
+            out.append((display, info.modid, full_path))
         else:
             guessed = _name_from_filename(jar.name)
-            out.append((guessed, "", jar.name))
+            out.append((guessed, "", full_path))
     # Dedupe by lowercase display name
     seen = set()
     deduped: list[tuple[str, str, str]] = []
