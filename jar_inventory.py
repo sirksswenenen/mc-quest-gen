@@ -2,20 +2,26 @@
 jar_inventory.py
 ================
 
-Extracts the *real* item inventory of a Minecraft mod from its .jar file:
+Extracts the *real* item inventory of a Minecraft 1.12.2 mod from its .jar:
 
-  • recipe outputs from assets/<modid>/recipes/*.json
-    and data/<modid>/recipes/*.json  → DEFINITIVE list of craftable items
-  • lang entries from assets/<modid>/lang/en_us.lang / en_US.lang
-    and en_us.json                   → display names for items / blocks
-  • blockstate file names             → registered blocks
-  • Patchouli book entries from
-    assets/<modid>/patchouli_books/<book>/en_us/{categories,entries}/*.json
-    → mod author's official progression backbone
+Registry-name sources (definitive — these are items the mod actually adds):
+  • assets/<modid>/models/item/**/*.json       (filename = registry name)
+  • assets/<modid>/blockstates/*.json          (filename = block registry name)
+  • assets/<modid>/recipes/**/*.json           (result.item field)
+  • data/<modid>/recipes/**/*.json             (newer mods)
+  • assets/<modid>/config/*.ini                (IC2-style text recipe configs)
 
-This is consumed by mc_quest_gen.build_prompt() so the AI gets a list of
-ITEMS THAT ACTUALLY EXIST and a structural backbone for the quest chain,
-instead of guessing (and hallucinating things like `ic2:copper_furnace`).
+Display-name sources (used to *label* registry items, not to invent them):
+  • assets/<modid>/lang/en_us.lang | en_US.lang | en_us.json
+  • assets/<modid>/lang_<modid>/en_us.properties     (IC2-style quirky path)
+
+Mod-author progression backbone:
+  • assets/<modid>/patchouli_books/<book>/en_us/{categories,entries}/*.json
+
+The key design rule: lang files NEVER add new registry IDs to the inventory.
+They only *decorate* IDs we already know are real (because they appear in
+models/blockstates/recipes). That is what kills the IE-style problem of
+sucking in Patchouli category names, advancements, subtitles, manuals, etc.
 
 Stdlib only — zipfile + json + re.
 """
@@ -37,37 +43,47 @@ from pathlib import Path
 @dataclass
 class PatchouliEntry:
     category: str
-    name: str            # display name of the entry
-    icon_item: str       # e.g. "ic2:macerator"
-    items: list[str]     # item ids referenced inside pages
+    name: str
+    icon_item: str
+    items: list[str]
     order: int = 0
 
 
 @dataclass
 class PatchouliBook:
-    book_id: str         # e.g. "botania:lexicon"
+    book_id: str
     title: str
-    categories: list[str] = field(default_factory=list)   # ordered
+    categories: list[str] = field(default_factory=list)
     entries: list[PatchouliEntry] = field(default_factory=list)
 
 
 @dataclass
 class JarInventory:
     modid: str = ""
-    recipe_outputs: dict[str, int] = field(default_factory=dict)     # item_id -> craft count
-    item_display_names: dict[str, str] = field(default_factory=dict) # item_id -> "Macerator"
-    block_ids: set[str] = field(default_factory=set)                 # ids inferred from blockstates
-    raw_lang: dict[str, str] = field(default_factory=dict)           # lang_key -> value (raw)
+    # Registry sources (truthy = "this item exists in the mod")
+    recipe_outputs: dict[str, int] = field(default_factory=dict)    # item_id -> max craft count
+    item_model_ids: set[str] = field(default_factory=set)           # from models/item/
+    block_ids: set[str] = field(default_factory=set)                # from blockstates/
+    # Display names (resolved against registry sources only)
+    item_display_names: dict[str, str] = field(default_factory=dict)
+    raw_lang: dict[str, str] = field(default_factory=dict)
+    # Patchouli (mod author's own progression book)
     patchouli_books: list[PatchouliBook] = field(default_factory=list)
 
     def has_signal(self) -> bool:
-        return bool(self.recipe_outputs or self.item_display_names or
+        return bool(self.recipe_outputs or self.item_model_ids or
                     self.block_ids or self.patchouli_books)
 
     def all_item_ids(self) -> set[str]:
         out: set[str] = set(self.recipe_outputs)
-        out |= set(self.item_display_names)
+        out |= self.item_model_ids
         out |= self.block_ids
+        # also names referenced inside patchouli books (mod author's own list)
+        for book in self.patchouli_books:
+            for ent in book.entries:
+                out.update(ent.items)
+                if ent.icon_item:
+                    out.add(ent.icon_item)
         return out
 
 
@@ -76,20 +92,7 @@ class JarInventory:
 # ─────────────────────────────────────────────
 
 
-_RECIPE_PATHS = ("assets/", "data/")     # prefixes inside the jar
-
-
 def _extract_result_item(recipe: dict) -> tuple[str, int]:
-    """Return (item_id, count) from a Forge/vanilla recipe JSON.
-
-    Returns ("", 0) if no recognizable result item.
-    Handles all common shapes:
-      result: "modid:item"
-      result: {"item": "modid:item", "count": 3}
-      result: {"id":   "modid:item"}
-      output: "modid:item"          (some mods)
-      output: {"item": "modid:item"}
-    """
     for key in ("result", "output"):
         r = recipe.get(key)
         if isinstance(r, str) and ":" in r:
@@ -105,13 +108,86 @@ def _extract_result_item(recipe: dict) -> tuple[str, int]:
     return "", 0
 
 
-def _parse_recipes(zf: zipfile.ZipFile, modid_filter: str | None,
-                   inv: JarInventory) -> None:
-    """Scan recipes/*.json files and record output items."""
+def _parse_ini_recipes(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None:
+    """Pick up recipe outputs from IC2-style INI files.
+
+    IC2 (and a handful of other 1.12.2 mods) keep their craft definitions
+    as plain-text 'config' files instead of one JSON per recipe. The format
+    is roughly::
+
+        ;<comment>
+        <input set> = <output_item>
+        ; or, in shapeless:
+        <ingredient1> <ingredient2> = <output_item>
+
+    The output spec follows ``<modid>:<base>[#<variant>][@<meta>][*<count>]``
+    where ``<variant>`` may contain ``:`` or ``,`` (NBT-style cable specs).
+
+    We accept any ``.ini`` under ``assets/<modid>/config/``. For IC2-shaped
+    outputs like ``ic2:te#batbox`` we add BOTH ``ic2:te`` (the real
+    registry base) AND ``ic2:batbox`` (the variant suffix that matches the
+    lang harvest), so the prompt summary can rank either form correctly.
+    """
+    if not modid:
+        return
+    prefix = f"assets/{modid}/config/"
+    known_ids: set[str] = (set(inv.item_model_ids) | inv.block_ids
+                           | set(inv.item_display_names) | set(inv.recipe_outputs))
+    for name in zf.namelist():
+        if not name.startswith(prefix) or not name.endswith(".ini"):
+            continue
+        try:
+            text = zf.read(name).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        for raw in text.splitlines():
+            line = raw.lstrip("\ufeff").strip()
+            if not line or line.startswith(";") or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            # Output is the right-hand side of the LAST '='.
+            rhs = line.rsplit("=", 1)[1].strip()
+            if not rhs:
+                continue
+            # Strip trailing ', ...' alternative input sets that follow the
+            # output (rare, but allowed by the format). The output is the
+            # FIRST whitespace token; trailing space-separated '@hidden',
+            # '@consuming' etc. are recipe-level attributes, not item meta.
+            spec = rhs.split()[0]
+            # Strip a stray trailing comma if the line ends with ", ..."
+            spec = spec.rstrip(",")
+            m = _IC2_RECIPE_OUTPUT_RE.match(spec)
+            if not m:
+                continue
+            out_modid = m.group("modid")
+            base = m.group("base")
+            variant = m.group("variant") or ""
+            count_s = m.group("count")
+            count = int(count_s) if count_s else 1
+            # Only count outputs that belong to this mod. Cross-mod outputs
+            # (e.g. uu_recipes producing minecraft:cobblestone) are real
+            # craftable results, but they aren't items added by THIS mod
+            # and would only confuse the per-mod quest generator.
+            if out_modid != modid:
+                continue
+            base_id = f"{out_modid}:{base}"
+            inv.recipe_outputs[base_id] = max(inv.recipe_outputs.get(base_id, 0), count)
+            # Variant-derived id: only add if it resolves to something the
+            # jar already knows about (item model, blockstate, or a lang
+            # harvest). Otherwise we'd invent phantom ids like 'ic2:water'
+            # from 'ic2:fluid_cell#water'.
+            if variant and re.fullmatch(r"[a-z0-9_]+", variant):
+                v_id = f"{out_modid}:{variant}"
+                if v_id in known_ids:
+                    inv.recipe_outputs[v_id] = max(inv.recipe_outputs.get(v_id, 0), count)
+
+
+def _parse_recipes(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None:
+    """Pick up recipe outputs from assets/<modid>/recipes/ and data/<modid>/recipes/."""
     for name in zf.namelist():
         if not name.endswith(".json"):
             continue
-        # accept   assets/<modid>/recipes/...    and    data/<modid>/recipes/...
         parts = name.split("/")
         if len(parts) < 4:
             continue
@@ -119,9 +195,7 @@ def _parse_recipes(zf: zipfile.ZipFile, modid_filter: str | None,
             continue
         if parts[2] != "recipes":
             continue
-        modid_in_path = parts[1]
-        if modid_filter and modid_in_path != modid_filter:
-            # still allow it but only when it really belongs to this mod
+        if modid and parts[1] != modid:
             continue
         try:
             data = json.loads(zf.read(name).decode("utf-8", errors="replace"))
@@ -135,17 +209,124 @@ def _parse_recipes(zf: zipfile.ZipFile, modid_filter: str | None,
 
 
 # ─────────────────────────────────────────────
-# Lang extraction
+# Item-model and blockstate extraction (the REAL registry-name truth)
 # ─────────────────────────────────────────────
 
 
-_LANG_FILE_NAMES = ("en_us.lang", "en_US.lang", "en_us.json")
+def _parse_item_models(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None:
+    """assets/<modid>/models/item/<...>/<name>.json
+    Every registered item gets a model JSON (unless the mod ships custom
+    model loaders — those are rare). The filename IS the registry name."""
+    if not modid:
+        return
+    prefix = f"assets/{modid}/models/item/"
+    skip_subdirs = {"builtin", "block"}     # not user-facing registry names
+    for name in zf.namelist():
+        if not name.startswith(prefix) or not name.endswith(".json"):
+            continue
+        rel = name[len(prefix):-len(".json")]
+        if not rel or rel.endswith("/"):
+            continue
+        # skip nested helper models like 'metal/inner_xyz' if they look like
+        # internal variants -- the outermost folder is the registry name for
+        # metadata-style items in many old mods. We keep them all, the
+        # quality filter at the end will downrank duplicates.
+        if any(rel.startswith(sd + "/") for sd in skip_subdirs):
+            continue
+        # take the deepest path component as the variant name; full path
+        # joined with underscore captures sub-folder variants like
+        # 'armor/bronze_helmet' -> 'armor_bronze_helmet' which matches
+        # how Forge usually exposes such variants in lang files.
+        flat = rel.replace("/", "_")
+        # Drop pure-digit names like '36.json' (those are minecraft:36 leftovers)
+        if flat.isdigit():
+            continue
+        inv.item_model_ids.add(f"{modid}:{flat}")
+
+
+def _parse_blockstates(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None:
+    if not modid:
+        return
+    prefix = f"assets/{modid}/blockstates/"
+    for name in zf.namelist():
+        if not name.startswith(prefix) or not name.endswith(".json"):
+            continue
+        rel = name[len(prefix):-len(".json")]
+        if "/" in rel or not rel:
+            continue
+        inv.block_ids.add(f"{modid}:{rel}")
+
+
+# ─────────────────────────────────────────────
+# Lang display-name extraction
+# ─────────────────────────────────────────────
+
+
+# Files we look at, in priority order
+_LANG_CANDIDATE_NAMES = (
+    "en_us.lang", "en_US.lang", "en_us.json", "en_US.json",
+)
+_PROPERTIES_CANDIDATE_NAMES = ("en_us.properties", "en_US.properties")
+
+# Keys we trust as "this names an item/block". Anything else (chat,
+# subtitle, gui, advancement, manual, …) is rejected.
+_ITEMLIKE_PREFIX_RE = re.compile(
+    r"^(item|tile|block|fluid|entity)\."
+)
+_NAME_SUFFIX_RE = re.compile(r"\.(name|displayname)$", re.IGNORECASE)
+# Things that LOOK item-like but are NOT actual items.
+# Match against the FULL key (not just the leading word), so e.g.
+# 'item.immersiveengineering.tools.name' is rejected because it contains
+# '.manual.' or '.category.' anywhere. Plain 'item.foo.tools.name' is fine.
+_BAD_SEGMENT_RE = re.compile(
+    r"(^|\.)(manual|tooltip|subtitle|desc|description|info|category|"
+    r"shortname|tagline|landing|page|chat|subtitle|gui|key|modifier|"
+    r"death|advancement|achievement|stat|book|container|inventory|menu|"
+    r"options|commands|itemgroup|selectworld|createworld|connect|"
+    r"disconnect|multiplayer|language|generator|gamemode|texturepack|"
+    r"enchantment|narrator|filled_map|effect|biome|update|update_news|"
+    r"news|credits|patreon|dev|page_|page0|page1|page2)(\.|$)",
+    re.IGNORECASE,
+)
+# Lang-key top-level prefixes that are NEVER item/block names.
+_BAD_TOP_PREFIX_RE = re.compile(
+    r"^(desc|chat|subtitle|gui|key|modifier|death|potion|"
+    r"advancement|achievement|stat|tooltip|info|book|"
+    r"container|inventory|menu|options|commands|itemgroup|"
+    r"selectworld|createworld|connect|disconnect|multiplayer|"
+    r"language|generator|gamemode|texturepack|enchantment|"
+    r"narrator|filled_map|effect|biome|the_|ie|update|news|"
+    r"manual|credits)\."
+)
+# IC2-style prefixes that DO denote real items in some old mods.
+# These categories all map to actual registered items in IC2 (and in mods
+# that adopt IC2's lang convention).
+_IC2_STYLE_PREFIX_RE = re.compile(
+    r"^(te|cable|pipe|coke|wire|resource|misc_resource|crafting|crop_res|"
+    r"nuclear|cell|cover|painter|wall|upgrade|kit|fluid|tool|armor|"
+    r"reactor|battery|nano|quantum|jetpack|hazmat|cf|brewing|rotor)\."
+    r"([a-z0-9_]+)$"
+)
+
+# Recipe-output spec used in IC2 INI recipe files:
+#   <modid>:<base>[#<variant>][@<meta>][*<count>]
+# The variant may contain ':' or ',' (NBT-style), so we accept anything
+# except '@', '*' and whitespace.
+_IC2_RECIPE_OUTPUT_RE = re.compile(
+    r"^(?P<modid>[a-zA-Z0-9_]+):(?P<base>[a-zA-Z0-9_]+)"
+    r"(?:#(?P<variant>[^@*\s]+))?"
+    r"(?:@(?P<meta>[\dA-Za-z*_-]+))?"
+    r"(?:\*(?P<count>\d+))?$"
+)
+# Bare lang keys like 'wrench = Wrench' that name an item directly.
+# Snake_case, lowercase, at least 2 chars so we don't catch single letters.
+_BARE_ITEM_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,}$")
 
 
 def _parse_lang_dot_lang(text: str) -> dict[str, str]:
     out: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.lstrip("\ufeff").strip()
+    for raw in text.splitlines():
+        line = raw.lstrip("\ufeff").strip()
         if not line or line.startswith("#"):
             continue
         if "=" not in line:
@@ -170,106 +351,202 @@ def _parse_lang_json(text: str) -> dict[str, str]:
             if isinstance(v, (str, int, float))}
 
 
-# common lang key → registry key heuristics for 1.12.2 mods
-#   tile.foo.name             →  modid:foo
-#   item.foo.name             →  modid:foo
-#   tile.modid.foo.name       →  modid:foo
-#   item.modid.foo.name       →  modid:foo
-#   modid.foo.name            →  modid:foo
-#   tile.foo                  →  modid:foo  (no .name suffix)
-_LANG_KEY_RE = re.compile(
-    r"^(?:tile|item|block|fluid|enchantment|entity)\."
-    r"(?:[a-z0-9_]+\.)?"         # optional modid prefix
-    r"([A-Za-z0-9_]+?)"          # the actual name (lazy)
-    r"(?:\.name|\.tooltip|\.desc|\.description)?$"
-)
-_LANG_NAME_SUFFIX_RE = re.compile(r"\.(name|displayName)$", re.IGNORECASE)
-
-
-def _lang_key_to_item_id(key: str, modid: str) -> str:
-    """Best-effort: turn a lang key into a `modid:item_id` candidate.
-
-    Returns "" if the key doesn't look like an item/block name.
-    """
-    if not key or not modid:
-        return ""
-    # only keep keys that end in .name / .displayName — those are user-facing labels
-    if not _LANG_NAME_SUFFIX_RE.search(key):
-        return ""
-    m = _LANG_KEY_RE.match(key)
-    if not m:
-        # fallback: take everything between the type prefix and `.name`
-        body = re.sub(r"^(tile|item|block|fluid)\.", "", key)
-        body = _LANG_NAME_SUFFIX_RE.sub("", body)
-        # drop a leading modid.
-        body = re.sub(rf"^{re.escape(modid)}\.", "", body)
-        # take last segment
-        body = body.split(".")[-1]
-    else:
-        body = m.group(1)
-    if not body:
-        return ""
-    # CamelCase → snake_case (Forge convention for registry names)
-    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", body).lower()
-    snake = re.sub(r"[^a-z0-9_]+", "_", snake).strip("_")
-    if not snake:
-        return ""
-    return f"{modid}:{snake}"
-
-
-def _parse_lang(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None:
-    """Pull display-name pairs from assets/<modid>/lang/."""
+def _read_all_lang(zf: zipfile.ZipFile, modid: str) -> dict[str, str]:
+    """Read every English-locale lang/properties file in the mod and merge."""
+    merged: dict[str, str] = {}
     if not modid:
-        return
-    found_paths: list[str] = []
-    for name in zf.namelist():
-        if not name.startswith(f"assets/{modid}/lang/"):
+        return merged
+    candidates: list[str] = []
+    # 1) Standard layout: assets/<modid>/lang/en_us.{lang,json}
+    for n in zf.namelist():
+        if not n.startswith(f"assets/{modid}/lang/"):
             continue
-        base = name.rsplit("/", 1)[-1]
-        if base in _LANG_FILE_NAMES:
-            found_paths.append(name)
-    if not found_paths:
-        # try other lang locales as a fallback so we still get *something*
-        for name in zf.namelist():
-            if name.startswith(f"assets/{modid}/lang/") and name.endswith((".lang", ".json")):
-                found_paths.append(name)
+        base = n.rsplit("/", 1)[-1]
+        if base in _LANG_CANDIDATE_NAMES:
+            candidates.append(n)
+    # 2) Quirky layout: assets/<modid>/lang_<modid>/en_us.properties
+    for n in zf.namelist():
+        if "/lang_" not in n:
+            continue
+        base = n.rsplit("/", 1)[-1]
+        if base in _PROPERTIES_CANDIDATE_NAMES:
+            candidates.append(n)
+    # 3) Last resort: ANY en_us* in this modid's assets dir
+    if not candidates:
+        for n in zf.namelist():
+            if not n.startswith(f"assets/{modid}/"):
+                continue
+            base = n.rsplit("/", 1)[-1].lower()
+            if base.startswith("en_us") and (n.endswith(".lang") or n.endswith(".json")
+                                             or n.endswith(".properties")):
+                candidates.append(n)
                 break
-    for path in found_paths:
+    for path in candidates:
         try:
             text = zf.read(path).decode("utf-8", errors="replace")
         except Exception:
             continue
         if path.endswith(".json"):
-            entries = _parse_lang_json(text)
+            merged.update(_parse_lang_json(text))
         else:
-            entries = _parse_lang_dot_lang(text)
-        inv.raw_lang.update(entries)
-        for k, v in entries.items():
-            if not v:
-                continue
-            item_id = _lang_key_to_item_id(k, modid)
-            if item_id and item_id not in inv.item_display_names:
-                inv.item_display_names[item_id] = v
+            merged.update(_parse_lang_dot_lang(text))
+    return merged
 
 
-# ─────────────────────────────────────────────
-# Blockstates → block registry names
-# ─────────────────────────────────────────────
+def _candidate_lang_keys(modid: str, base: str) -> list[str]:
+    """All lang keys that might carry a display name for `modid:base`.
+
+    Order matters — earlier keys are preferred.
+    """
+    keys = [
+        f"item.{modid}.{base}.name",
+        f"tile.{modid}.{base}.name",
+        f"block.{modid}.{base}.name",
+        f"fluid.{modid}.{base}.name",
+        f"item.{modid}.{base}",
+        f"tile.{modid}.{base}",
+        # IC2-style: bare names + 'te.<x>', 'cable.<x>', 'pipe.<x>'
+        f"te.{base}",
+        f"cable.{base}",
+        f"pipe.{base}",
+        f"item.{base}.name",
+        f"tile.{base}.name",
+        f"block.{base}.name",
+        base,
+    ]
+    # also try CamelCase variants of 'base'
+    camel = "".join(p.title() for p in base.split("_"))
+    keys += [
+        f"item.{camel}.name",
+        f"tile.{camel}.name",
+        f"item.{modid}.{camel}.name",
+        f"tile.{modid}.{camel}.name",
+    ]
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            uniq.append(k)
+    return uniq
 
 
-def _parse_blockstates(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None:
-    if not modid:
+def _assign_display_names(modid: str, lang: dict[str, str], inv: JarInventory) -> None:
+    """For every registry item we know is real, try to find its display name
+    in the lang map. Lang never adds new items here — it only labels them."""
+    if not modid or not lang:
         return
-    prefix = f"assets/{modid}/blockstates/"
-    for name in zf.namelist():
-        if not name.startswith(prefix) or not name.endswith(".json"):
+    known: set[str] = set(inv.recipe_outputs)
+    known |= inv.item_model_ids
+    known |= inv.block_ids
+    for iid in known:
+        if ":" not in iid:
             continue
-        bn = name[len(prefix):-len(".json")]
-        if "/" in bn:
+        ns, base = iid.split(":", 1)
+        if ns != modid:
             continue
-        bn = bn.strip()
-        if bn:
-            inv.block_ids.add(f"{modid}:{bn}")
+        if iid in inv.item_display_names:
+            continue
+        for k in _candidate_lang_keys(modid, base):
+            v = lang.get(k)
+            if v is None:
+                continue
+            # tolerate Forge §-color codes
+            v_clean = re.sub(r"§[0-9a-fk-or]", "", v).strip()
+            if v_clean:
+                inv.item_display_names[iid] = v_clean
+                break
+
+    # Store the raw lang map (capped to avoid blowing up memory)
+    if len(lang) <= 5000:
+        inv.raw_lang.update(lang)
+
+
+def _strip_color_codes(s: str) -> str:
+    s = re.sub(r"§[0-9a-fk-or]", "", s)
+    return s.strip()
+
+
+def _harvest_items_from_lang(modid: str, lang: dict[str, str], inv: JarInventory) -> None:
+    """Walk the lang map and harvest item IDs that the file structure missed.
+
+    This is the safety net for old / obfuscated mods that don't ship
+    standard JSON item models:
+      • IC2-style: `te.macerator = Macerator`,  `cable.copper_cable_0 = ...`,
+        `pipe.steel_pipe_small = ...`. The portion after the prefix IS the
+        registry-name suffix in IC2's actual code.
+      • Forge-conventional but metadata-based: `item.<modid>.<sub>.<variant>.name`,
+        where <sub> is the registry name and <variant> is a metadata label
+        (e.g. `item.immersiveengineering.metal.ingot_copper.name = Copper Ingot`).
+        For quest prompts we expose `<modid>:<sub>_<variant>` so the AI can
+        refer to the specific variant. FTB Quests can match these via NBT.
+      • Simple `item.<X>.name` / `tile.<X>.name` keys, snake_cased.
+
+    Patchouli book entries (`ie.manual.entry.X.name`, `*.category.*`, etc.),
+    subtitles, tooltips, advancements, GUIs and the like are filtered out
+    via the BAD_TOP_PREFIX / BAD_SEGMENT rules.
+    """
+    if not modid or not lang:
+        return
+    for k, v in lang.items():
+        if not isinstance(v, str):
+            continue
+        v_clean = _strip_color_codes(v)
+        if not v_clean:
+            continue
+        kl = k.lower()
+
+        # 1) IC2-style: 'te.macerator', 'cable.copper_cable_0', etc.
+        m = _IC2_STYLE_PREFIX_RE.match(kl)
+        if m:
+            base = m.group(2)
+            if base.isdigit() or len(base) < 2:
+                continue
+            iid = f"{modid}:{base}"
+            inv.item_model_ids.add(iid)
+            inv.item_display_names.setdefault(iid, v_clean)
+            continue
+
+        # 1b) Bare lang key naming an item directly: 'wrench = Wrench',
+        # 'coke = Coal Coke', 'forge_hammer = Forge Hammer'. IC2 and a
+        # handful of other old mods do this. Reject any value that looks
+        # like a UI label (ends with ':' or contains '%s'/'%1$s').
+        if "." not in k and _BARE_ITEM_KEY_RE.match(kl):
+            if v_clean.endswith(":") or "%" in v_clean:
+                continue
+            iid = f"{modid}:{kl}"
+            inv.item_model_ids.add(iid)
+            inv.item_display_names.setdefault(iid, v_clean)
+            continue
+
+        # 2) Forge-conventional: item./tile./block./fluid./entity. + .name
+        if not _ITEMLIKE_PREFIX_RE.match(kl):
+            continue
+        if not _NAME_SUFFIX_RE.search(kl):
+            continue
+        if _BAD_TOP_PREFIX_RE.match(kl):
+            continue
+        if _BAD_SEGMENT_RE.search(kl):
+            continue
+
+        # Strip prefix + .name suffix to get the body
+        body = re.sub(r"^(item|tile|block|fluid|entity)\.", "", k, flags=re.IGNORECASE)
+        body = _NAME_SUFFIX_RE.sub("", body)
+        body_parts = body.split(".")
+        # Strip optional modid prefix from the body
+        if body_parts and body_parts[0].lower() == modid.lower():
+            body_parts = body_parts[1:]
+        if not body_parts:
+            continue
+        flat = "_".join(body_parts)
+        # CamelCase -> snake_case for keys like item.ItemPlateIron.name
+        flat = re.sub(r"(?<!^)(?=[A-Z])", "_", flat).lower()
+        flat = re.sub(r"[^a-z0-9_]+", "_", flat).strip("_")
+        if not flat or flat.isdigit() or len(flat) < 2:
+            continue
+        iid = f"{modid}:{flat}"
+        inv.item_model_ids.add(iid)
+        inv.item_display_names.setdefault(iid, v_clean)
 
 
 # ─────────────────────────────────────────────
@@ -278,11 +555,9 @@ def _parse_blockstates(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> No
 
 
 def _patchouli_collect_item_refs(obj: object, out: list[str]) -> None:
-    """Recursively pull item-ID looking strings out of a Patchouli page tree."""
     if isinstance(obj, str):
-        # patchouli supports "modid:item" and "modid:item{nbt}#meta"
         s = obj.strip()
-        m = re.match(r"^([a-z0-9_]+):([a-z0-9_/.]+)", s)
+        m = re.match(r"^([a-z0-9_]+):([a-z0-9_/.-]+)", s)
         if m and len(m.group(1)) >= 2 and len(m.group(2)) >= 2:
             out.append(f"{m.group(1)}:{m.group(2)}")
         return
@@ -291,13 +566,11 @@ def _patchouli_collect_item_refs(obj: object, out: list[str]) -> None:
             _patchouli_collect_item_refs(x, out)
         return
     if isinstance(obj, dict):
-        # explicit fields we care about
         for key in ("item", "icon", "output", "result", "stack",
                     "main_item", "main_stack"):
             v = obj.get(key)
             if v is not None:
                 _patchouli_collect_item_refs(v, out)
-        # input lists in crafting pages
         for key in ("ingredients", "items", "recipes"):
             v = obj.get(key)
             if v is not None:
@@ -305,13 +578,6 @@ def _patchouli_collect_item_refs(obj: object, out: list[str]) -> None:
 
 
 def _parse_patchouli(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None:
-    """Find Patchouli books inside the jar and parse their structure.
-
-    Layout (1.12.2 with Patchouli):
-        assets/<modid>/patchouli_books/<book_id>/book.json
-        assets/<modid>/patchouli_books/<book_id>/en_us/categories/*.json
-        assets/<modid>/patchouli_books/<book_id>/en_us/entries/**/*.json
-    """
     if not modid:
         return
     prefix = f"assets/{modid}/patchouli_books/"
@@ -328,8 +594,6 @@ def _parse_patchouli(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None
 
     for book_id in sorted(book_ids):
         book = PatchouliBook(book_id=f"{modid}:{book_id}", title=book_id)
-
-        # try to read book.json for a title
         book_meta = f"{prefix}{book_id}/book.json"
         if book_meta in zf.namelist():
             try:
@@ -340,8 +604,6 @@ def _parse_patchouli(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None
                         book.title = name.strip()
             except Exception:
                 pass
-
-        # categories
         cat_prefix = f"{prefix}{book_id}/en_us/categories/"
         for name in sorted(zf.namelist()):
             if not name.startswith(cat_prefix) or not name.endswith(".json"):
@@ -355,8 +617,6 @@ def _parse_patchouli(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None
             title = data.get("name") or name.split("/")[-1][:-5]
             if isinstance(title, str) and title.strip():
                 book.categories.append(title.strip())
-
-        # entries
         ent_prefix = f"{prefix}{book_id}/en_us/entries/"
         for name in sorted(zf.namelist()):
             if not name.startswith(ent_prefix) or not name.endswith(".json"):
@@ -378,7 +638,6 @@ def _parse_patchouli(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None
             refs: list[str] = []
             _patchouli_collect_item_refs(data.get("pages"), refs)
             _patchouli_collect_item_refs(icon, refs)
-            # dedupe preserving order
             seen: set[str] = set()
             uniq_refs: list[str] = []
             for r in refs:
@@ -392,7 +651,6 @@ def _parse_patchouli(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None
                 items=uniq_refs,
                 order=order,
             ))
-
         if book.categories or book.entries:
             inv.patchouli_books.append(book)
 
@@ -403,31 +661,32 @@ def _parse_patchouli(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None
 
 
 def inspect_jar(jar_path: Path, modid: str = "") -> JarInventory:
-    """Open `jar_path` and extract everything we can about its mod content.
-
-    `modid` (optional) — if you already know the mod's registry id (from
-    mcmod.info / mods.toml), pass it. Otherwise this function does a
-    best-effort sniff to figure out which subdir under assets/ holds the
-    main mod's assets.
-    """
     inv = JarInventory(modid=modid)
     try:
         with zipfile.ZipFile(jar_path, "r") as zf:
             if not modid:
                 modid = _sniff_modid(zf)
                 inv.modid = modid
-            _parse_recipes(zf, modid_filter=modid or None, inv=inv)
-            _parse_lang(zf, modid, inv)
+            _parse_recipes(zf, modid, inv)
+            _parse_item_models(zf, modid, inv)
             _parse_blockstates(zf, modid, inv)
+            lang = _read_all_lang(zf, modid)
+            _assign_display_names(modid, lang, inv)
+            _harvest_items_from_lang(modid, lang, inv)
+            # IC2 (and a few other 1.12.2 mods) ship recipes as INI text
+            # under assets/<modid>/config/. Run this AFTER the lang harvest
+            # so we can validate '#variant' suffixes against known item ids.
+            _parse_ini_recipes(zf, modid, inv)
             _parse_patchouli(zf, modid, inv)
+            # A final pass: assign display names to recipe outputs we picked
+            # up from INI files (they may not have been resolved earlier).
+            _assign_display_names(modid, lang, inv)
     except (zipfile.BadZipFile, OSError):
         return inv
     return inv
 
 
 def _sniff_modid(zf: zipfile.ZipFile) -> str:
-    """If the caller didn't pass modid, guess from the most-populated
-    assets/<modid>/ subdirectory (excluding 'minecraft' and 'forge')."""
     counts: dict[str, int] = {}
     for name in zf.namelist():
         if name.startswith("assets/") and name.count("/") >= 2:
@@ -437,7 +696,6 @@ def _sniff_modid(zf: zipfile.ZipFile) -> str:
             counts[sub] = counts.get(sub, 0) + 1
     if not counts:
         return ""
-    # pick the one with the most files
     return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
@@ -447,18 +705,30 @@ def _sniff_modid(zf: zipfile.ZipFile) -> str:
 
 
 # items we never want to surface to the AI as quest targets
+# Matches `_stairs`, `_slab`, etc. either at end of string, or followed by
+# digits (variant suffix) or another underscore segment (e.g. concrete_stairs_xyz).
 _TRIVIAL_SUFFIXES_RE = re.compile(
     r"(_slab|_stairs|_wall|_fence|_carpet|_panel|_button|_pressure_plate|"
-    r"_trapdoor|_door|_pane|_block_white|_block_orange|_block_magenta|"
-    r"_block_light_blue|_block_yellow|_block_lime|_block_pink|_block_gray|"
-    r"_block_silver|_block_cyan|_block_purple|_block_blue|_block_brown|"
-    r"_block_green|_block_red|_block_black|_block_light_gray)$"
+    r"_trapdoor|_door|_pane)(_[a-z0-9]+)*\d*$"
 )
+# Variant suffixes like _0/_1/_2 from metadata items — when there are multiple
+# variants we keep just the most informative one (lowest index).
+_VARIANT_TAIL_RE = re.compile(r"_(\d+)$")
 
 
 def _looks_trivial(item_id: str) -> bool:
     base = item_id.split(":", 1)[1] if ":" in item_id else item_id
-    return bool(_TRIVIAL_SUFFIXES_RE.search(base))
+    if _TRIVIAL_SUFFIXES_RE.search(base):
+        return True
+    # decorative variants
+    if base.endswith(("_block_white", "_block_black", "_block_red", "_block_green",
+                      "_block_blue", "_block_yellow", "_block_orange",
+                      "_block_purple", "_block_pink", "_block_cyan",
+                      "_block_brown", "_block_gray", "_block_light_gray",
+                      "_block_lime", "_block_magenta", "_block_silver",
+                      "_block_light_blue")):
+        return True
+    return False
 
 
 def _pretty_from_id(item_id: str) -> str:
@@ -467,58 +737,69 @@ def _pretty_from_id(item_id: str) -> str:
     return base.title() if base else item_id
 
 
-def summarize_for_prompt(inv: JarInventory, max_items: int = 120) -> dict:
-    """Build a structured summary that build_prompt() can splice into the
-    AI prompt.
+def summarize_for_prompt(inv: JarInventory, max_items: int = 200) -> dict:
+    """Build a structured summary that build_prompt() splices into the prompt.
 
-    Returns a dict with:
-      • inventory_lines : list[str]  — "modid:item   Display Name"
-      • inventory_total : int
-      • patchouli_outline : list[str] — "Category: Entry" outline if available
-      • patchouli_used : bool
+    Returns:
+      inventory_lines: list[str] — "modid:item   Display Name" (capped to max_items)
+      inventory_total: int       — full unique-item count BEFORE the cap
+      inventory_truncated: bool
+      patchouli_outline: list[str] — "[Book]\n  • Category\n      - Entry" lines
+      patchouli_used: bool
     """
-    items: dict[str, str] = {}
-    # 1) start with recipe outputs (definitive, craftable)
-    for iid in inv.recipe_outputs:
-        if _looks_trivial(iid):
-            continue
-        display = inv.item_display_names.get(iid) or _pretty_from_id(iid)
-        items[iid] = display
-    # 2) supplement with lang-derived items (those with display names)
-    for iid, display in inv.item_display_names.items():
-        if _looks_trivial(iid):
-            continue
-        if iid not in items:
-            items[iid] = display
-    # 3) supplement with blockstates (only if room left)
-    for iid in inv.block_ids:
-        if _looks_trivial(iid):
-            continue
-        if iid not in items:
-            items[iid] = _pretty_from_id(iid)
+    # 1) Gather every real registry id from the jar
+    real_ids: set[str] = set()
+    real_ids |= set(inv.recipe_outputs)
+    real_ids |= inv.item_model_ids
+    real_ids |= inv.block_ids
 
-    # If we still went over the cap, prefer items that have BOTH a recipe and
-    # a display name (those are the most quest-worthy: real, craftable, with
-    # a human label).
+    # 2) Drop trivial cosmetic variants (slabs/stairs/colored versions)
+    candidates = [iid for iid in real_ids if not _looks_trivial(iid)]
+
+    # 3) Collapse metadata _0/_1/... variants when the base item is present
+    base_to_variants: dict[str, list[str]] = {}
+    for iid in candidates:
+        m = _VARIANT_TAIL_RE.search(iid)
+        if m:
+            base_to_variants.setdefault(iid[: m.start()], []).append(iid)
+    # If a "base" item exists in candidates AND it has _N variants, keep only
+    # the base item plus the LOWEST-index variant (representative of the family)
+    kept: set[str] = set(candidates)
+    for base, variants in base_to_variants.items():
+        if base in kept and len(variants) > 1:
+            variants_sorted = sorted(variants, key=lambda v: int(_VARIANT_TAIL_RE.search(v).group(1)))
+            for v in variants_sorted[1:]:
+                kept.discard(v)
+
+    # 4) Build display map
+    display: dict[str, str] = {}
+    for iid in kept:
+        display[iid] = inv.item_display_names.get(iid) or _pretty_from_id(iid)
+
+    # 5) Rank: items with BOTH recipe + display name first; then display name;
+    # then recipes; then bare model/blockstate ids without a label.
     def _rank(item_id: str) -> tuple[int, int, str]:
         has_recipe = item_id in inv.recipe_outputs
-        has_lang = item_id in inv.item_display_names
-        return (0 if (has_recipe and has_lang) else
-                1 if has_recipe else
-                2 if has_lang else 3,
-                -inv.recipe_outputs.get(item_id, 0),
-                item_id)
+        has_named = item_id in inv.item_display_names
+        if has_recipe and has_named:
+            tier = 0
+        elif has_named:
+            tier = 1
+        elif has_recipe:
+            tier = 2
+        else:
+            tier = 3
+        return (tier, -inv.recipe_outputs.get(item_id, 0), item_id)
 
-    item_ids_sorted = sorted(items.keys(), key=_rank)
-    if max_items and len(item_ids_sorted) > max_items:
-        item_ids_sorted = item_ids_sorted[:max_items]
+    sorted_ids = sorted(display.keys(), key=_rank)
+    total = len(sorted_ids)
+    truncated = max_items > 0 and total > max_items
+    if truncated:
+        sorted_ids = sorted_ids[:max_items]
 
-    inventory_lines = [
-        f"  {iid}   {items[iid]}"
-        for iid in item_ids_sorted
-    ]
+    inventory_lines = [f"  {iid}   {display[iid]}" for iid in sorted_ids]
 
-    # Patchouli outline (the mod author's own progression spine)
+    # 6) Patchouli outline (mod author's own progression spine)
     patchouli_lines: list[str] = []
     for book in inv.patchouli_books:
         if not book.entries:
@@ -536,8 +817,8 @@ def summarize_for_prompt(inv: JarInventory, max_items: int = 120) -> dict:
 
     return {
         "inventory_lines": inventory_lines,
-        "inventory_total": len(items),
-        "inventory_truncated": max_items > 0 and len(items) > max_items,
+        "inventory_total": total,
+        "inventory_truncated": truncated,
         "patchouli_outline": patchouli_lines,
         "patchouli_used": bool(patchouli_lines),
     }
