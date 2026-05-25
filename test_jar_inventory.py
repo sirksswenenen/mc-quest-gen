@@ -58,6 +58,8 @@ def make_synthetic_ic2_jar(out_path: Path) -> None:
             "te.recycler = Recycler",
             "te.nuclear_reactor = Nuclear Reactor",
             "te.coke_kiln = Coke Kiln",
+            "te.batbox = BatBox",
+            "te.chargepad_batbox = Charge Pad (BatBox)",
             "cable.copper_cable_0 = Copper Cable",
             "cable.copper_cable_1 = Insulated Copper Cable",
             "pipe.bronze_pipe_small = Small Bronze Pipe",
@@ -88,6 +90,29 @@ def make_synthetic_ic2_jar(out_path: Path) -> None:
 
         # A non-IC2 asset that should NOT be counted as IC2's
         zf.writestr("assets/minecraft/lang/en_us.lang", "ignored=yes")
+
+        # IC2-style text recipe configs (this is the main reason real IC2
+        # ships zero JSON recipes — most recipes live in these INIs).
+        zf.writestr("assets/ic2/config/shaped_recipes.ini", "\n".join([
+            "; shaped_recipes",
+            "; <inputs> = <output>",
+            "",
+            '"PSP|SPS|PSP" P:OreDict:plateLead S:minecraft:stone@* = ic2:resource#reactor_vessel*4',
+            '"PCP|BBB|PPP" P:OreDict:plankWood C:ic2:cable#type:tin,insulation:1 = ic2:te#batbox',
+            '"CPC|RBR|" B:ic2:te#batbox = ic2:te#chargepad_batbox',
+            '"FCF|C C|RMR" F:minecraft:flint M:ic2:resource#machine = ic2:te#macerator',
+            # Cross-mod output — should NOT pollute IC2's recipe outputs
+            '"   |UUU|   " U:ic2:misc_resource#matter = minecraft:cobblestone*64',
+            # NBT-style variant — base should be added, complex variant skipped
+            '"   |UUU|   " U:ic2:misc_resource#matter = ic2:cable#type:tin,insulation:1',
+            # Recipe attribute after the spec must not break the parser
+            '"VVV|VCV|VVV" V:ic2:resource#reactor_vessel = ic2:te#reactor_fluid_port @consuming',
+        ]))
+        zf.writestr("assets/ic2/config/shapeless_recipes.ini", "\n".join([
+            "; shapeless_recipes",
+            "OreDict:plateCopper OreDict:craftingToolWireCutter = ic2:cable#type:copper,insulation:0*2",
+            "OreDict:plateBronze OreDict:craftingToolForgeHammer = ic2:casing#bronze*2",
+        ]))
 
 
 def make_synthetic_botania_jar(out_path: Path) -> None:
@@ -141,12 +166,26 @@ def test_ic2_inventory():
         make_synthetic_ic2_jar(jar)
         inv = jar_inventory.inspect_jar(jar, modid="ic2")
         assert inv.modid == "ic2", inv.modid
-        # recipes
+        # JSON recipes
         assert "ic2:macerator" in inv.recipe_outputs
         assert "ic2:iron_furnace" in inv.recipe_outputs
         assert "ic2:induction_furnace" in inv.recipe_outputs
         assert "ic2:mass_fabricator" in inv.recipe_outputs
         assert "ic2:uu_matter" in inv.recipe_outputs
+        # IC2 INI recipes — base ids
+        assert "ic2:te" in inv.recipe_outputs, sorted(inv.recipe_outputs)
+        assert "ic2:resource" in inv.recipe_outputs
+        assert "ic2:cable" in inv.recipe_outputs
+        assert "ic2:casing" in inv.recipe_outputs
+        # IC2 INI recipes — variant ids (only added when known via lang/models)
+        assert "ic2:batbox" in inv.recipe_outputs
+        assert "ic2:chargepad_batbox" in inv.recipe_outputs
+        assert "ic2:reactor_vessel" not in inv.recipe_outputs, \
+            "variant must be gated by known ids (lang doesn't define it)"
+        # Cross-mod output (minecraft:cobblestone) must NOT pollute IC2
+        assert "minecraft:cobblestone" not in inv.recipe_outputs
+        # Counts are preserved from the INI '*N' suffix
+        assert inv.recipe_outputs["ic2:resource"] >= 4
         # lang-derived items (IC2-style 'te.X = Y' prefixes feed back into the inventory)
         assert "ic2:macerator" in inv.item_display_names, sorted(inv.item_display_names)
         assert inv.item_display_names["ic2:macerator"] == "Macerator"

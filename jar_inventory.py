@@ -9,6 +9,7 @@ Registry-name sources (definitive — these are items the mod actually adds):
   • assets/<modid>/blockstates/*.json          (filename = block registry name)
   • assets/<modid>/recipes/**/*.json           (result.item field)
   • data/<modid>/recipes/**/*.json             (newer mods)
+  • assets/<modid>/config/*.ini                (IC2-style text recipe configs)
 
 Display-name sources (used to *label* registry items, not to invent them):
   • assets/<modid>/lang/en_us.lang | en_US.lang | en_us.json
@@ -105,6 +106,81 @@ def _extract_result_item(recipe: dict) -> tuple[str, int]:
                 except (ValueError, TypeError):
                     return item, 1
     return "", 0
+
+
+def _parse_ini_recipes(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None:
+    """Pick up recipe outputs from IC2-style INI files.
+
+    IC2 (and a handful of other 1.12.2 mods) keep their craft definitions
+    as plain-text 'config' files instead of one JSON per recipe. The format
+    is roughly::
+
+        ;<comment>
+        <input set> = <output_item>
+        ; or, in shapeless:
+        <ingredient1> <ingredient2> = <output_item>
+
+    The output spec follows ``<modid>:<base>[#<variant>][@<meta>][*<count>]``
+    where ``<variant>`` may contain ``:`` or ``,`` (NBT-style cable specs).
+
+    We accept any ``.ini`` under ``assets/<modid>/config/``. For IC2-shaped
+    outputs like ``ic2:te#batbox`` we add BOTH ``ic2:te`` (the real
+    registry base) AND ``ic2:batbox`` (the variant suffix that matches the
+    lang harvest), so the prompt summary can rank either form correctly.
+    """
+    if not modid:
+        return
+    prefix = f"assets/{modid}/config/"
+    known_ids: set[str] = (set(inv.item_model_ids) | inv.block_ids
+                           | set(inv.item_display_names) | set(inv.recipe_outputs))
+    for name in zf.namelist():
+        if not name.startswith(prefix) or not name.endswith(".ini"):
+            continue
+        try:
+            text = zf.read(name).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        for raw in text.splitlines():
+            line = raw.lstrip("\ufeff").strip()
+            if not line or line.startswith(";") or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            # Output is the right-hand side of the LAST '='.
+            rhs = line.rsplit("=", 1)[1].strip()
+            if not rhs:
+                continue
+            # Strip trailing ', ...' alternative input sets that follow the
+            # output (rare, but allowed by the format). The output is the
+            # FIRST whitespace token; trailing space-separated '@hidden',
+            # '@consuming' etc. are recipe-level attributes, not item meta.
+            spec = rhs.split()[0]
+            # Strip a stray trailing comma if the line ends with ", ..."
+            spec = spec.rstrip(",")
+            m = _IC2_RECIPE_OUTPUT_RE.match(spec)
+            if not m:
+                continue
+            out_modid = m.group("modid")
+            base = m.group("base")
+            variant = m.group("variant") or ""
+            count_s = m.group("count")
+            count = int(count_s) if count_s else 1
+            # Only count outputs that belong to this mod. Cross-mod outputs
+            # (e.g. uu_recipes producing minecraft:cobblestone) are real
+            # craftable results, but they aren't items added by THIS mod
+            # and would only confuse the per-mod quest generator.
+            if out_modid != modid:
+                continue
+            base_id = f"{out_modid}:{base}"
+            inv.recipe_outputs[base_id] = max(inv.recipe_outputs.get(base_id, 0), count)
+            # Variant-derived id: only add if it resolves to something the
+            # jar already knows about (item model, blockstate, or a lang
+            # harvest). Otherwise we'd invent phantom ids like 'ic2:water'
+            # from 'ic2:fluid_cell#water'.
+            if variant and re.fullmatch(r"[a-z0-9_]+", variant):
+                v_id = f"{out_modid}:{variant}"
+                if v_id in known_ids:
+                    inv.recipe_outputs[v_id] = max(inv.recipe_outputs.get(v_id, 0), count)
 
 
 def _parse_recipes(zf: zipfile.ZipFile, modid: str, inv: JarInventory) -> None:
@@ -223,9 +299,28 @@ _BAD_TOP_PREFIX_RE = re.compile(
     r"manual|credits)\."
 )
 # IC2-style prefixes that DO denote real items in some old mods.
+# These categories all map to actual registered items in IC2 (and in mods
+# that adopt IC2's lang convention).
 _IC2_STYLE_PREFIX_RE = re.compile(
-    r"^(te|cable|pipe|coke|wire)\.([a-z0-9_]+)$"
+    r"^(te|cable|pipe|coke|wire|resource|misc_resource|crafting|crop_res|"
+    r"nuclear|cell|cover|painter|wall|upgrade|kit|fluid|tool|armor|"
+    r"reactor|battery|nano|quantum|jetpack|hazmat|cf|brewing|rotor)\."
+    r"([a-z0-9_]+)$"
 )
+
+# Recipe-output spec used in IC2 INI recipe files:
+#   <modid>:<base>[#<variant>][@<meta>][*<count>]
+# The variant may contain ':' or ',' (NBT-style), so we accept anything
+# except '@', '*' and whitespace.
+_IC2_RECIPE_OUTPUT_RE = re.compile(
+    r"^(?P<modid>[a-zA-Z0-9_]+):(?P<base>[a-zA-Z0-9_]+)"
+    r"(?:#(?P<variant>[^@*\s]+))?"
+    r"(?:@(?P<meta>[\dA-Za-z*_-]+))?"
+    r"(?:\*(?P<count>\d+))?$"
+)
+# Bare lang keys like 'wrench = Wrench' that name an item directly.
+# Snake_case, lowercase, at least 2 chars so we don't catch single letters.
+_BARE_ITEM_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,}$")
 
 
 def _parse_lang_dot_lang(text: str) -> dict[str, str]:
@@ -405,9 +500,21 @@ def _harvest_items_from_lang(modid: str, lang: dict[str, str], inv: JarInventory
         m = _IC2_STYLE_PREFIX_RE.match(kl)
         if m:
             base = m.group(2)
-            if base.isdigit():
+            if base.isdigit() or len(base) < 2:
                 continue
             iid = f"{modid}:{base}"
+            inv.item_model_ids.add(iid)
+            inv.item_display_names.setdefault(iid, v_clean)
+            continue
+
+        # 1b) Bare lang key naming an item directly: 'wrench = Wrench',
+        # 'coke = Coal Coke', 'forge_hammer = Forge Hammer'. IC2 and a
+        # handful of other old mods do this. Reject any value that looks
+        # like a UI label (ends with ':' or contains '%s'/'%1$s').
+        if "." not in k and _BARE_ITEM_KEY_RE.match(kl):
+            if v_clean.endswith(":") or "%" in v_clean:
+                continue
+            iid = f"{modid}:{kl}"
             inv.item_model_ids.add(iid)
             inv.item_display_names.setdefault(iid, v_clean)
             continue
@@ -566,7 +673,14 @@ def inspect_jar(jar_path: Path, modid: str = "") -> JarInventory:
             lang = _read_all_lang(zf, modid)
             _assign_display_names(modid, lang, inv)
             _harvest_items_from_lang(modid, lang, inv)
+            # IC2 (and a few other 1.12.2 mods) ship recipes as INI text
+            # under assets/<modid>/config/. Run this AFTER the lang harvest
+            # so we can validate '#variant' suffixes against known item ids.
+            _parse_ini_recipes(zf, modid, inv)
             _parse_patchouli(zf, modid, inv)
+            # A final pass: assign display names to recipe outputs we picked
+            # up from INI files (they may not have been resolved earlier).
+            _assign_display_names(modid, lang, inv)
     except (zipfile.BadZipFile, OSError):
         return inv
     return inv
