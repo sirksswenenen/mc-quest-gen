@@ -44,29 +44,47 @@ def make_synthetic_ic2_jar(out_path: Path) -> None:
             "output": "ic2:uu_matter",
         }))
 
-        # Lang file (1.12.2 style: en_US.lang with .lang extension)
-        zf.writestr("assets/ic2/lang/en_US.lang", "\n".join([
-            "tile.blockMachine.macerator.name=Macerator",
-            "tile.blockMachine.iron_furnace.name=Iron Furnace",
-            "tile.blockMachine.induction_furnace.name=Induction Furnace",
-            "tile.blockMachine.mass_fabricator.name=Mass Fabricator",
-            "tile.blockMachine.electric_furnace.name=Electric Furnace",
-            "tile.blockMachine.compressor.name=Compressor",
-            "tile.blockMachine.extractor.name=Extractor",
-            "tile.blockMachine.recycler.name=Recycler",
-            "item.itemRubber.name=Rubber",
-            "item.itemPlateIron.name=Iron Plate",
-            "tile.blockOreCopper.name=Copper Ore",
-            "tile.blockOreTin.name=Tin Ore",
-            "tile.blockOreUranium.name=Uranium Ore",
-            "tile.blockMachine.nuclear_reactor.name=Nuclear Reactor",
+        # Lang file — real IC2 uses 'lang_ic2/en_us.properties' with quirky
+        # 'te.X = Y' / 'cable.X = Y' prefixes, not the Forge convention.
+        zf.writestr("assets/ic2/lang_ic2/en_us.properties", "\n".join([
+            "# en_US translation",
+            "te.macerator = Macerator",
+            "te.iron_furnace = Iron Furnace",
+            "te.induction_furnace = Induction Furnace",
+            "te.mass_fabricator = Mass Fabricator",
+            "te.electric_furnace = Electric Furnace",
+            "te.compressor = Compressor",
+            "te.extractor = Extractor",
+            "te.recycler = Recycler",
+            "te.nuclear_reactor = Nuclear Reactor",
+            "te.coke_kiln = Coke Kiln",
+            "cable.copper_cable_0 = Copper Cable",
+            "cable.copper_cable_1 = Insulated Copper Cable",
+            "pipe.bronze_pipe_small = Small Bronze Pipe",
+            "rubber = Rubber",
+            "item.plate.iron = Iron Plate",
+            # Junk we should reject:
+            "ie.manual.category.energy.name = Power, wires, generators",
+            "item.tooltip.power = Power",
+            "subtitle.macerator = Macerator sound",
+            "chat.something = Something",
+            "advancement.foo.name = Some advancement",
         ]))
 
-        # Blockstates
+        # Blockstates — registry names live here too
         zf.writestr("assets/ic2/blockstates/macerator.json", json.dumps({}))
         zf.writestr("assets/ic2/blockstates/iron_furnace.json", json.dumps({}))
         zf.writestr("assets/ic2/blockstates/nuclear_reactor.json", json.dumps({}))
         zf.writestr("assets/ic2/blockstates/ore_copper.json", json.dumps({}))
+
+        # Item model JSONs — these are the registry-name truth
+        for name in ["macerator", "iron_furnace", "induction_furnace",
+                     "mass_fabricator", "electric_furnace", "compressor",
+                     "extractor", "recycler", "nuclear_reactor",
+                     "coke_kiln"]:
+            zf.writestr(f"assets/ic2/models/item/{name}.json", json.dumps({
+                "parent": f"ic2:block/{name}",
+            }))
 
         # A non-IC2 asset that should NOT be counted as IC2's
         zf.writestr("assets/minecraft/lang/en_us.lang", "ignored=yes")
@@ -129,22 +147,31 @@ def test_ic2_inventory():
         assert "ic2:induction_furnace" in inv.recipe_outputs
         assert "ic2:mass_fabricator" in inv.recipe_outputs
         assert "ic2:uu_matter" in inv.recipe_outputs
-        # lang derived items
+        # lang-derived items (IC2-style 'te.X = Y' prefixes feed back into the inventory)
         assert "ic2:macerator" in inv.item_display_names, sorted(inv.item_display_names)
         assert inv.item_display_names["ic2:macerator"] == "Macerator"
+        assert inv.item_display_names.get("ic2:coke_kiln") == "Coke Kiln"
+        assert inv.item_display_names.get("ic2:copper_cable_0") == "Copper Cable"
         # blockstates
         assert "ic2:macerator" in inv.block_ids
         assert "ic2:nuclear_reactor" in inv.block_ids
+        # item models
+        assert "ic2:macerator" in inv.item_model_ids
+        assert "ic2:nuclear_reactor" in inv.item_model_ids
         # summary
         summary = jar_inventory.summarize_for_prompt(inv, max_items=200)
-        # Make sure summary contains the key items
         joined = "\n".join(summary["inventory_lines"])
         assert "ic2:macerator" in joined
         assert "ic2:induction_furnace" in joined
         assert "ic2:mass_fabricator" in joined
-        # And critically, NO hallucinated "ic2:copper_furnace"
+        # critically, NO hallucinated 'ic2:copper_furnace'
         assert "copper_furnace" not in joined
-        # Verify minecraft assets did NOT leak in
+        # JUNK we explicitly fed in must be REJECTED
+        assert "ic2:energy" not in joined, "Patchouli/manual category leaked!"
+        assert "ic2:power" not in joined, "tooltip key leaked!"
+        assert "ic2:something" not in joined, "chat key leaked!"
+        assert "ic2:foo" not in joined, "advancement key leaked!"
+        # verify minecraft assets did NOT leak in
         assert "minecraft:" not in joined or "ignored" not in joined
         print(f"IC2: {summary['inventory_total']} items, sample:")
         for line in summary["inventory_lines"][:10]:
