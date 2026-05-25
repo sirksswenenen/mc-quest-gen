@@ -302,18 +302,13 @@ def analyze_mod(name: str, modid: str = "", file: str = "") -> ModAnalysis:
     name = name.strip()
     if not name and not modid:
         return ModAnalysis(name=name, score=-100, file=file)
-    queries = []
-    if name:
-        queries.append(name)
-    if modid and modid.lower() != name.lower().replace(" ", ""):
-        queries.append(modid)
-    hit = None
-    for q in queries:
-        hit = scraper.search_modrinth(q, game_version="1.12.2")
-        if hit:
-            break
-    if not hit and queries:
-        hit = scraper.search_modrinth(queries[0])
+    # Try CurseForge first (best 1.12.2 coverage); fall back to Modrinth.
+    # Both calls are no-ops returning None when there's no match.
+    hit = scraper.search_curseforge(name or modid, game_version="1.12.2", modid=modid)
+    if hit is None:
+        hit = scraper.search_modrinth(name or modid, game_version="1.12.2", modid=modid)
+    if hit is None and modid and modid.lower() != (name or "").lower().replace(" ", ""):
+        hit = scraper.search_modrinth(modid, game_version="1.12.2", modid=modid)
     curated = scraper.get_offline_stages(name or modid)
     if not curated and modid:
         curated = scraper.get_offline_stages(modid)

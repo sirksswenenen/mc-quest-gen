@@ -40,16 +40,26 @@ MC_ASSETS_BLOCKS = (
 _mod_icon_cache: dict[str, Optional[str]] = {}
 
 
-def _modrinth_icon_for(modid: str) -> Optional[str]:
-    """Best-effort lookup of a mod's icon URL via Modrinth."""
+def _modrinth_icon_for(modid: str, display_name: str = "") -> Optional[str]:
+    """Best-effort lookup of a mod's icon URL — try CurseForge first (if
+    a key is configured) then Modrinth. Result is cached per modid."""
     if modid in _mod_icon_cache:
         return _mod_icon_cache[modid]
-    url = None
-    for query in (modid, modid.replace("_", " "), modid.replace("-", " ")):
-        hit = scraper.search_modrinth(query)
-        if hit:
-            url = hit.get("icon_url") or None
-            if url:
+    url: Optional[str] = None
+    # Display name is usually richer than the bare modid, prefer it for search
+    queries = [q for q in (display_name, modid,
+                           modid.replace("_", " "),
+                           modid.replace("-", " ")) if q]
+    for q in queries:
+        hit = scraper.search_curseforge(q, modid=modid)
+        if hit and hit.get("icon_url"):
+            url = hit["icon_url"]
+            break
+    if not url:
+        for q in queries:
+            hit = scraper.search_modrinth(q, modid=modid)
+            if hit and hit.get("icon_url"):
+                url = hit["icon_url"]
                 break
     _mod_icon_cache[modid] = url
     return url
@@ -117,7 +127,8 @@ def _chapter_payload(chapter: dict) -> dict:
                 break
         if first_item and ":" in first_item:
             modid_guess = first_item.split(":", 1)[0]
-    mod_icon = _modrinth_icon_for(modid_guess) if modid_guess else None
+    chapter_title = chapter.get("title", "") or chapter.get("_mod_source_name", "")
+    mod_icon = _modrinth_icon_for(modid_guess, chapter_title) if modid_guess else None
     if not mod_icon:
         ic = chapter.get("icon", {}).get("item", "")
         if ic.startswith("minecraft:"):

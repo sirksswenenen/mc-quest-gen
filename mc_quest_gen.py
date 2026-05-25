@@ -134,14 +134,19 @@ def process_mod(
     game_version: str = "1.12.2",
     lang: str = "en",
     verbose: bool = False,
+    modid_hint: str = "",
 ) -> dict | None:
     print(f"  - {mod_name}")
 
     print("     · fetching mod info…", end="", flush=True)
-    mod_info = scraper.get_mod_info(mod_name, game_version)
+    mod_info = scraper.get_mod_info(mod_name, game_version, modid=modid_hint)
     offline_stages = scraper.get_offline_stages(mod_name)
     src = mod_info.get("source", "unknown")
-    print(f" done (source={src}, modid={mod_info.get('modid') or '?'})")
+    final_modid = mod_info.get("modid") or "?"
+    if src == "unknown":
+        print(f" not found online (modid={final_modid})")
+    else:
+        print(f" done (source={src}, modid={final_modid})")
 
     print("     · asking AI for quest chain…", end="", flush=True)
     messages = build_prompt(mod_info, offline_stages, lang)
@@ -153,7 +158,7 @@ def process_mod(
         print(ai_response[:1500] + ("…" if len(ai_response) > 1500 else ""))
         print("--- end ---\n")
 
-    modid = mod_info.get("modid") or mod_name.lower().replace(" ", "")
+    modid = mod_info.get("modid") or modid_hint or mod_name.lower().replace(" ", "")
     quests = ftbquests.parse_ai_quests(ai_response, mod_name, modid)
     print(f"     · {len(quests)} quests parsed")
 
@@ -329,6 +334,12 @@ def cmd_html_only(args: argparse.Namespace) -> int:
     if not src.exists():
         print(f"Error: file not found: {src}", file=sys.stderr)
         return 1
+    # Configure CF so mod icons resolve cleanly
+    try:
+        cfg = providers.load_config()
+        scraper.configure_curseforge((cfg.get("curseforge") or {}).get("api_key", ""))
+    except Exception:
+        pass
     out = Path(args.html_out) if args.html_out else src.parent / "preview.html"
     result = html_visualizer.render_from_file(src, out)
     print(f"Wrote: {result}")
@@ -357,6 +368,16 @@ def cmd_analyze(args: argparse.Namespace, items: list[tuple[str, str, str]]) -> 
         print("Error: --analyze needs a mod list (use -m, --mods-file, or --scan-dir).",
               file=sys.stderr)
         sys.exit(1)
+    # Configure CurseForge here too — analysis happens BEFORE the main
+    # configure step, and CF lookups dramatically improve match accuracy
+    cfg = providers.load_config()
+    cf_key = (cfg.get("curseforge") or {}).get("api_key", "")
+    scraper.configure_curseforge(cf_key)
+    if cf_key:
+        print("  (using CurseForge for mod metadata)")
+    else:
+        print("  (CurseForge key not configured — using Modrinth only; "
+              "many 1.12.2 mods won't be found. See README for CF setup.)")
     print(f"\nAnalyzing {len(items)} mod(s)…")
     results = analyzer.analyze_mods(items)
     if args.top is not None:
@@ -403,11 +424,18 @@ def main() -> None:
                   file=sys.stderr)
             sys.exit(1)
         ai_cfg = providers.load_config()
+        scraper.configure_curseforge((ai_cfg.get("curseforge") or {}).get("api_key", ""))
         mod_name = args.regenerate_mod
         idx = find_chapter_for_mod(existing_root, mod_name)
+        # If we had the modid stored when we generated the original chapter,
+        # reuse it to keep item IDs consistent.
+        modid_hint = ""
+        if idx >= 0:
+            modid_hint = existing_root["chapters"][idx].get("_modid", "") or ""
         chapter = process_mod(mod_name, ai_cfg,
                               game_version=args.game_version,
-                              lang=args.lang, verbose=args.verbose)
+                              lang=args.lang, verbose=args.verbose,
+                              modid_hint=modid_hint)
         if not chapter:
             print(f"Failed to regenerate {mod_name}.", file=sys.stderr)
             sys.exit(1)
@@ -422,6 +450,9 @@ def main() -> None:
         sys.exit(0)
 
     items = collect_mods(args)
+
+    # Map display-name → modid (from jar metadata) so we can pass to process_mod
+    modid_map: dict[str, str] = {name: modid for name, modid, _file in items if modid}
 
     if args.analyze:
         mods = cmd_analyze(args, items)
@@ -444,6 +475,10 @@ def main() -> None:
     if not has_any_key:
         print("⚠  No API keys configured. Run: python mc_quest_gen.py --setup")
         sys.exit(1)
+
+    # Tell scraper which CurseForge key to use (if any)
+    cf_key = (ai_cfg.get("curseforge") or {}).get("api_key", "")
+    scraper.configure_curseforge(cf_key)
 
     is_append = args.append or (existing_root is not None and not args.regenerate_mod)
     existing_names: list[str] = []
@@ -479,6 +514,7 @@ def main() -> None:
                 game_version=args.game_version,
                 lang=args.lang,
                 verbose=args.verbose,
+                modid_hint=modid_map.get(mod_name, ""),
             )
             if chapter:
                 new_chapters.append(chapter)
